@@ -96,9 +96,11 @@ Safe, read-only tools for basic Intersight operations:
 - **Security & Health Check Agent (1 tool)**
   * `generate_security_health_report` - Generate comprehensive security and health check report
 
-### 2. All Tools Mode - 199+ Complete Toolset
+### 2. All Tools Mode - 213 Complete Toolset
 
 Full CRUD operations including create, update, delete capabilities.
+
+This mode also enables the **browser/vKVM console tools** (`browser_*`, `vkvm_*`, `launch_vkvm_session`, `reset_tunneled_vkvm`). These are intentionally excluded from Core Mode because they send console input, create vKVM sessions, PATCH server settings, and can issue arbitrary session-authenticated REST writes — see [docs/VKVM_BROWSER.md](docs/VKVM_BROWSER.md).
 
 ## 🚀 Quick Configuration
 

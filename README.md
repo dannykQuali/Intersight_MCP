@@ -5,10 +5,25 @@ An MCP (Model Context Protocol) server that enables LLMs to interact with Cisco 
 
 The server supports two configuration modes:
 
-- **🛡️ Core Mode (Default)**: 66 essential read-only tools for safe exploration
-- **🚀 All Tools Mode**: 199+ complete toolset with full CRUD capabilities
+- **🛡️ Core Mode (Default)**: 66 essential **read-only** tools for safe exploration
+- **🚀 All Tools Mode**: 213 complete toolset with full CRUD capabilities **plus the browser/vKVM console tools**
 
 See [TOOL_CONFIGURATION.md](TOOL_CONFIGURATION.md) for detailed configuration options.
+
+> ⚠️ The browser/vKVM tools below are **not** part of the read-only core set — they send console input, create vKVM sessions, and can issue session-authenticated writes. They are only available in **All Tools Mode** (`INTERSIGHT_TOOL_MODE=all`).
+
+### 🖥️ vKVM Console Access (see & control servers) — All Tools Mode only
+
+The server includes browser-based vKVM tools that let an AI agent **see a server's console via screenshots and control it with keyboard/mouse** — e.g. watch BIOS/boot screens, install an OS, or debug a hung server. Because Intersight only allows vKVM session creation from an interactive user session (not API keys), the flow starts with a human login in a visible browser window:
+
+1. `browser_open` — opens a visible browser at the Intersight login page (persistent profile; cookies survive restarts)
+2. The user completes the SSO/MFA login once; the agent polls `browser_status` until `loggedIn: true`
+3. `launch_vkvm_session` — creates a tunneled vKVM session for a server and opens its HTML5 console
+4. `browser_screenshot` / `browser_send_keys` / `browser_mouse` — the agent sees and controls the console
+
+See [docs/VKVM_BROWSER.md](docs/VKVM_BROWSER.md) for details, requirements, and limitations.
+
+For **unattended/overnight runs**, the server can log itself in via Cisco ID (username + password + TOTP) and keep the session alive, so a session timeout doesn't blind the agent mid-run — see [docs/UNATTENDED_LOGIN.md](docs/UNATTENDED_LOGIN.md).
 
 ### Prerequisites
 

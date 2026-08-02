@@ -26,6 +26,12 @@ secrets/
 *.p12
 *.pfx
 
+# SSO credentials for unattended login (username/password/TOTP secret).
+# Keep the *.example.json template; never commit real credentials.
+intersight-sso*.json
+!intersight-sso.example.json
+.tmp/
+
 # Logs
 *.log
 logs/

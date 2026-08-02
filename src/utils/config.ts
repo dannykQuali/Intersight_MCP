@@ -127,6 +127,12 @@ const CORE_65_TOOLS = [
 
   // Security & Health Check Agent (1 tool)
   'generate_security_health_report'
+  // NOTE: The browser/vKVM tools (browser_*, vkvm_*, launch_vkvm_session,
+  // reset_tunneled_vkvm) are deliberately NOT in the core set. Core mode is
+  // read-only/safe-by-default, and those tools send console input, create vKVM
+  // sessions, PATCH server settings, or issue arbitrary session-authenticated
+  // REST writes (browser_intersight_api). They are only available in all-tools
+  // mode (INTERSIGHT_TOOL_MODE=all / enableAllTools).
 ];
 
 export function loadMCPServerConfig(): MCPServerConfig {
@@ -215,6 +221,87 @@ export function isToolEnabled(toolName: string, config: MCPServerConfig, allTool
 
 export function getEnabledTools(allTools: any[], config: MCPServerConfig): any[] {
   return allTools.filter(tool => isToolEnabled(tool.name, config, allTools.map(t => t.name)));
+}
+
+/**
+ * Credentials for automatic Cisco ID (SSO) login, so an unattended agent can
+ * re-establish the Intersight browser session when it times out.
+ *
+ * Everything is configurable. Prefer a credentials FILE over environment
+ * variables (env vars leak into process listings and child processes):
+ *
+ *   INTERSIGHT_SSO_CREDENTIALS_FILE=/path/to/intersight-sso.json
+ *   { "username": "...", "password": "...", "totp": "otpauth://totp/...", "accountName": "CHG-LAB-Intersight" }
+ *
+ * Or individually:
+ *   INTERSIGHT_SSO_USERNAME, INTERSIGHT_SSO_PASSWORD,
+ *   INTERSIGHT_SSO_TOTP           (otpauth:// URI or bare base32 secret)
+ *   INTERSIGHT_SSO_ACCOUNT_NAME   (which account to pick if the chooser appears)
+ *   INTERSIGHT_SSO_AUTO_LOGIN     ('false' disables auto-login even if creds exist)
+ *   INTERSIGHT_SESSION_KEEPALIVE_SECONDS (default 240; 0 disables the keepalive loop)
+ */
+export interface SsoConfig {
+  username?: string;
+  password?: string;
+  /** otpauth:// URI or bare base32 secret. */
+  totp?: string;
+  accountName?: string;
+  autoLogin: boolean;
+  keepaliveSeconds: number;
+  /** True when enough is configured to attempt an automated login. */
+  configured: boolean;
+  source: 'file' | 'env' | 'file+env' | 'none';
+  /**
+   * Extra step-by-step diagnostics for the login flow (e.g. a screenshot of the
+   * account chooser). Off by default; failures always capture a screenshot
+   * regardless. Enable with INTERSIGHT_SSO_DEBUG=true when a step stops matching.
+   */
+  debug: boolean;
+}
+
+export function loadSsoConfig(): SsoConfig {
+  let fileCreds: Record<string, any> = {};
+  let usedFile = false;
+  const credsPath = process.env.INTERSIGHT_SSO_CREDENTIALS_FILE;
+  if (credsPath) {
+    try {
+      fileCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+      usedFile = true;
+    } catch (error) {
+      // Never echo file contents; just report that it could not be read.
+      console.error(`Warning: could not read INTERSIGHT_SSO_CREDENTIALS_FILE (${credsPath}): ${(error as Error).message}`);
+    }
+  }
+
+  const username = process.env.INTERSIGHT_SSO_USERNAME || fileCreds.username || fileCreds.email;
+  const password = process.env.INTERSIGHT_SSO_PASSWORD || fileCreds.password;
+  const totp = process.env.INTERSIGHT_SSO_TOTP || fileCreds.totp || fileCreds.totpUri || fileCreds.totpSecret;
+  const accountName = process.env.INTERSIGHT_SSO_ACCOUNT_NAME || fileCreds.accountName;
+
+  const usedEnv = !!(
+    process.env.INTERSIGHT_SSO_USERNAME ||
+    process.env.INTERSIGHT_SSO_PASSWORD ||
+    process.env.INTERSIGHT_SSO_TOTP
+  );
+
+  const keepaliveRaw = Number(process.env.INTERSIGHT_SESSION_KEEPALIVE_SECONDS);
+  const keepaliveSeconds = Number.isFinite(keepaliveRaw) ? keepaliveRaw : 240;
+
+  const configured = !!(username && password);
+  const source: SsoConfig['source'] =
+    usedFile && usedEnv ? 'file+env' : usedFile ? 'file' : usedEnv ? 'env' : 'none';
+
+  return {
+    username,
+    password,
+    totp,
+    accountName,
+    autoLogin: process.env.INTERSIGHT_SSO_AUTO_LOGIN !== 'false' && configured,
+    keepaliveSeconds,
+    configured,
+    source,
+    debug: process.env.INTERSIGHT_SSO_DEBUG === 'true' || fileCreds.debug === true,
+  };
 }
 
 export function loadConfig(): IntersightConfig {

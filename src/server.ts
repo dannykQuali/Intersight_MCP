@@ -28,12 +28,14 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { IntersightApiService } from './services/intersightApi.js';
+import { BrowserService } from './services/browserService.js';
 import { loadConfig, loadMCPServerConfig, isToolEnabled, getEnabledTools, MCPServerConfig } from './utils/config.js';
 import { createSecurityHealthCheckReport } from './services/securityHealthCheckAgent.js';
 
 export class IntersightMCPServer {
   private server: Server;
   private apiService: IntersightApiService;
+  private browserService: BrowserService | null = null;
   private mcpConfig: MCPServerConfig;
 
   constructor() {
@@ -97,11 +99,16 @@ export class IntersightMCPServer {
 
       try {
         const result = await this.handleToolCall(name, args || {});
+        // Tools may return rich MCP content (e.g. screenshots as images)
+        if (result && typeof result === 'object' && Array.isArray((result as any).__mcpContent)) {
+          return { content: (result as any).__mcpContent };
+        }
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(result, null, 2),
+              // Compact (no pretty-print indentation) to reduce token usage.
+              text: JSON.stringify(result),
             },
           ],
         };
@@ -2624,10 +2631,27 @@ export class IntersightMCPServer {
       // Profile Management Tools
       {
         name: 'list_server_profiles',
-        description: 'List all server profiles',
+        description: 'List server profiles. Prefer scoping with filter/select/top for a targeted lookup instead of pulling all profiles (which can be very large).',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            filter: {
+              type: 'string',
+              description: "OData $filter, e.g. \"Name eq 'BMaaS-Profile'\" or \"AssignedServer.Moid eq '<moid>'\"",
+            },
+            select: {
+              type: 'string',
+              description: "OData $select — comma-separated fields to return, e.g. 'Name,Moid,AssignedServer'. Greatly reduces payload size.",
+            },
+            top: {
+              type: 'number',
+              description: 'OData $top — max number of profiles to return.',
+            },
+            orderby: {
+              type: 'string',
+              description: "OData $orderby, e.g. 'Name asc'.",
+            },
+          },
         },
       },
       {
@@ -3500,10 +3524,442 @@ export class IntersightMCPServer {
           properties: {},
         },
       },
+
+      // Browser & vKVM Tools (interactive user session)
+      // Intersight forbids creating vKVM sessions with API keys, so these tools
+      // drive a visible browser in which a human logs into Intersight once.
+      {
+        name: 'browser_open',
+        description: 'Open a visible (non-headless) browser window with a persistent profile and navigate to the Intersight login page. The user completes the SSO/MFA login interactively; the session is then available to all other browser_/vkvm tools. Returns loggedIn=true immediately if cookies from a previous login are still valid.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'URL to open (default: the Intersight base URL)',
+            },
+            width: {
+              type: 'number',
+              description: 'Viewport width in pixels (default: 1600)',
+            },
+            height: {
+              type: 'number',
+              description: 'Viewport height in pixels (default: 900)',
+            },
+          },
+        },
+      },
+      {
+        name: 'browser_status',
+        description: 'Report the browser state: whether it is open, whether the Intersight user session is logged in, the open tabs, the active vKVM sessions, and the automatic-login/keepalive status (configured, enabled, last login, last keepalive). Poll this after browser_open to wait for the user to finish logging in.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'browser_login',
+        description: 'Ensure a valid Intersight session, logging in automatically via Cisco ID (username + password + TOTP) if credentials are configured. Use for unattended/overnight runs so a session timeout does not blind the agent; also starts the session keepalive that re-logs-in on expiry. Returns loggedIn plus which steps completed. Never returns secrets. If credentials are not configured it says so and a human must log in in the browser window.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            force: {
+              type: 'boolean',
+              description: 'Re-run the login flow even if the current session still looks valid (default: false)',
+            },
+          },
+        },
+      },
+      {
+        name: 'launch_vkvm_session',
+        description: 'Launch a tunneled vKVM (KVM-over-IP console) session for a physical server and open its HTML5 client in a browser tab. Requires a logged-in Intersight browser session (browser_open first). Idempotent: if a live vKVM session for this server is already open it is REUSED (a server allows only one live tunneled session, so a duplicate launch would be born-dead) — pass forceNew to force a fresh one. After launching, use browser_screenshot to SEE the server console and browser_send_keys / browser_mouse to control it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'MOID of the physical server (compute.RackUnit or compute.Blade)',
+            },
+            forceNew: {
+              type: 'boolean',
+              description: 'Force a fresh session even if one is already open for this server (closes the existing tab first, waits for the server to free the single session slot, then relaunches). Default: false (reuse a live session).',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'browser_screenshot',
+        description: 'Take a PNG screenshot of a browser page — use it to SEE the server console of an open vKVM session. Returns the image itself plus the saved file path.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'Screenshot the vKVM page of this server (default: the most recently opened tab)',
+            },
+            fullPage: {
+              type: 'boolean',
+              description: 'Capture the full scrollable page instead of the viewport (default: false)',
+            },
+          },
+        },
+      },
+      {
+        name: 'browser_send_keys',
+        description: 'Send keyboard input to a browser page (e.g. type into a vKVM console). "text" is typed literally; "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'Target the vKVM page of this server (default: the most recently opened tab)',
+            },
+            text: {
+              type: 'string',
+              description: 'Literal text to type',
+            },
+            keys: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Special keys / combos to press after the text, e.g. ["Enter"] or ["Control+Alt+Delete"]',
+            },
+          },
+        },
+      },
+      {
+        name: 'browser_mouse',
+        description: 'Send mouse input to a browser page. Coordinates match what browser_screenshot shows (viewport pixels, top-left = 0,0) — click where you see things in the screenshot.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'Target the vKVM page of this server (default: the most recently opened tab)',
+            },
+            x: { type: 'number', description: 'X coordinate in pixels' },
+            y: { type: 'number', description: 'Y coordinate in pixels' },
+            action: {
+              type: 'string',
+              enum: ['click', 'doubleclick', 'move', 'down', 'up'],
+              description: 'Mouse action (default: click)',
+            },
+            button: {
+              type: 'string',
+              enum: ['left', 'right', 'middle'],
+              description: 'Mouse button (default: left)',
+            },
+            relativeTo: {
+              type: 'string',
+              enum: ['canvas', 'page'],
+              description: 'Coordinate origin: the page viewport (default, matches browser_screenshot pixels) or a real <canvas> element',
+            },
+          },
+          required: ['x', 'y'],
+        },
+      },
+      {
+        name: 'browser_goto',
+        description: 'Navigate the current browser tab (or a new one) to a URL.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'URL to navigate to' },
+            newPage: { type: 'boolean', description: 'Open in a new tab (default: false)' },
+          },
+          required: ['url'],
+        },
+      },
+      {
+        name: 'browser_evaluate',
+        description: 'Evaluate a JavaScript expression in a browser page and return its JSON-serializable result. Useful for inspecting the vKVM client page structure.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            script: { type: 'string', description: 'JavaScript expression to evaluate in the page' },
+            serverMoid: {
+              type: 'string',
+              description: 'Target the vKVM page of this server (default: the most recently opened tab)',
+            },
+          },
+          required: ['script'],
+        },
+      },
+      {
+        name: 'browser_intersight_api',
+        description: 'Call the Intersight REST API authenticated by the browser user session (cookies) instead of the API key. Needed for operations Intersight forbids for API keys, such as POST /api/v1/kvm/Sessions. Requires a logged-in browser (browser_open first).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            method: {
+              type: 'string',
+              enum: ['GET', 'POST', 'PATCH', 'DELETE'],
+              description: 'HTTP method',
+            },
+            path: {
+              type: 'string',
+              description: 'API path, e.g. "/api/v1/kvm/Sessions"',
+            },
+            body: {
+              type: 'object',
+              description: 'JSON request body for POST/PATCH',
+            },
+          },
+          required: ['method', 'path'],
+        },
+      },
+      {
+        name: 'close_vkvm_session',
+        description: 'Close the vKVM client page of a server (ends the console session client-side).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'MOID of the server whose vKVM page should be closed',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'reset_tunneled_vkvm',
+        description: 'Fix the Intersight bug where launching a tunneled vKVM session immediately shows "KVM session has ended": disables Tunneled vKVM on the server and re-enables it (waiting for each "Update Tunneled vKVM" workflow to complete, ~30s total). Run this when launch_vkvm_session produces a dead/ended console, then launch again.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'MOID of the physical server (compute.RackUnit or compute.Blade)',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_wait',
+        description: 'Block server-side until the console screen CHANGES (mode "change" — something happened, e.g. a reboot, a progress step, a menu appeared) or goes STABLE (mode "stable" — stopped changing for a few seconds, e.g. boot finished / a prompt is up), then return the frame at that moment as an image. Use this to act at the right instant without your own thinking latency: e.g. wait mode="stable" then screenshot to catch a settled boot menu. Returns outcome "changed"/"stable"/"timeout".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'Target the vKVM page of this server (default: most recent tab)' },
+            mode: { type: 'string', enum: ['change', 'stable'], description: 'Wait for the frame to change, or to go stable (default: change)' },
+            timeoutMs: { type: 'number', description: 'Max time to wait in ms (default: 60000)' },
+            intervalMs: { type: 'number', description: 'Sampling interval in ms (default: 500)' },
+            stablePeriodMs: { type: 'number', description: 'For mode "stable": how long the frame must stay quiet to count as stable (default: 3000)' },
+            threshold: { type: 'number', description: 'Fraction of pixels (0..1) that must differ to count as a change (default: 0.01)' },
+          },
+        },
+      },
+      {
+        name: 'vkvm_press_until',
+        description: 'Press key(s) repeatedly at a fixed interval until the console screen changes (default) or stabilizes, or until timeout — the machine-timed way to catch a boot prompt with no agent latency between frames. Classic use: keys ["F2"] or ["Delete"] or ["Escape"] to enter BIOS/boot setup during POST. Returns the final frame as an image plus the outcome.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'Target the vKVM page of this server (default: most recent tab)' },
+            keys: { type: 'array', items: { type: 'string' }, description: 'Key(s) to press each cycle, e.g. ["F2"], ["Delete"], ["Escape"]' },
+            intervalMs: { type: 'number', description: 'Delay between press cycles in ms (default: 300)' },
+            timeoutMs: { type: 'number', description: 'Max time to keep pressing in ms (default: 60000)' },
+            stopOn: { type: 'string', enum: ['change', 'stable'], description: 'Stop when the screen changes or stabilizes (default: change)' },
+            stablePeriodMs: { type: 'number', description: 'For stopOn "stable": quiet period required in ms (default: 2500)' },
+            threshold: { type: 'number', description: 'Pixel-change fraction (0..1) to count as a change (default: 0.02)' },
+          },
+          required: ['keys'],
+        },
+      },
+      {
+        name: 'vkvm_recent',
+        description: 'Get the most recent CONSOLE FRAMES from the continuous background recording as a filmstrip of images — the primary way to see what a server did while you were not looking. Recording starts automatically with launch_vkvm_session and samples every second, keeping every frame in which the screen changed. Prefer this over a single browser_screenshot when monitoring: one screenshot is a point sample and will miss reboots, transient prompts and error messages. Returns oldest-first with a timestamp and change ratio per frame.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            count: { type: 'number', description: 'How many frames to return (default 8)' },
+            scale: {
+              type: 'number',
+              description: 'Image scale 0.1-1.0 (default 0.7). Lower = fewer image tokens; use 1.0 with a small count when you need to read fine console text.',
+            },
+            changesOnly: {
+              type: 'boolean',
+              description: 'Only frames where the screen changed, skipping idle heartbeats (default true)',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_frames_at',
+        description: 'Inspect a specific moment in the console recording: returns the frame nearest the requested time PLUS neighbouring frames before and after it, so you see how the machine arrived at that state and what followed. Use after vkvm_timeline points you at an interesting timestamp.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            at: { type: 'string', description: 'ISO timestamp (or epoch milliseconds) of the moment of interest' },
+            secondsAgo: { type: 'number', description: 'Alternative to "at": how many seconds ago' },
+            before: { type: 'number', description: 'Frames to include before that moment (default 5)' },
+            after: { type: 'number', description: 'Frames to include after it (default 5)' },
+            scale: { type: 'number', description: 'Image scale 0.1-1.0 (default 0.7)' },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_timeline',
+        description: 'Text-only history of console changes (timestamp, change magnitude, reason) — costs no image tokens. Use it to find WHEN something happened across a long run, then call vkvm_frames_at to look at that moment. Also reports how many changes occurred since you last viewed frames.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            minutesAgo: { type: 'number', description: 'Only events from the last N minutes (default: all retained)' },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_record_start',
+        description: 'Start continuously recording a server console (normally automatic on launch_vkvm_session). Samples every second and stores every changed frame to a disk ring buffer, so nothing is missed between your looks.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the server whose console to record' },
+            intervalMs: { type: 'number', description: 'Sampling interval in ms (default 1000, minimum 250)' },
+            retentionMinutes: { type: 'number', description: 'How long to keep frames (default 120)' },
+            maxFrames: { type: 'number', description: 'Hard cap on retained frames (default 3000)' },
+            threshold: { type: 'number', description: 'Change fraction that counts as a real change (default 0.002)' },
+            heartbeatSeconds: { type: 'number', description: 'Store a frame at least this often even when idle (default 60)' },
+            antiBlankSeconds: {
+              type: 'number',
+              description: 'Nudge an IDLE console this often (seconds) so its screen does not blank into a screensaver and hide the machine state. Default 240; 0 disables.',
+            },
+            antiBlankMode: {
+              type: 'string',
+              enum: ['mouse', 'key', 'none'],
+              description: 'How to nudge: "mouse" (default, a 1px pointer move — cannot type or click, and bootloaders ignore it), "key" (also taps Shift; wakes a blanked Linux text console more reliably but can drop some distros into the GRUB menu during early boot), or "none".',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_record_stop',
+        description: 'Stop the continuous console recording for a server (retained frames stay available until they age out).',
+        inputSchema: {
+          type: 'object',
+          properties: { serverMoid: { type: 'string', description: 'MOID of the server' } },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_record_status',
+        description: 'Report recording state: frames stored, disk used, capture errors, and how many console changes have occurred since you last viewed frames.',
+        inputSchema: {
+          type: 'object',
+          properties: { serverMoid: { type: 'string', description: 'Omit to report every recorder' } },
+        },
+      },
+      {
+        name: 'vkvm_watch',
+        description: 'Watch the console for a fixed window (sampling at an interval) and report every moment the screen changed, with timestamps — answers "did anything happen / did it reboot while I was thinking?" in one call, instead of comparing two manually-spaced screenshots. Returns the first and last frames as images plus a list of change events.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'Target the vKVM page of this server (default: most recent tab)' },
+            durationMs: { type: 'number', description: 'How long to watch in ms (default: 30000, max: 300000)' },
+            intervalMs: { type: 'number', description: 'Sampling interval in ms (default: 1000)' },
+            threshold: { type: 'number', description: 'Pixel-change fraction (0..1) to count as a change (default: 0.01)' },
+            saveChangeFrames: { type: 'boolean', description: 'Also save a PNG of each change frame to disk (default: false)' },
+          },
+        },
+      },
+      {
+        name: 'browser_close',
+        description: 'Close the browser window. The Intersight login cookies persist in the profile directory, so a later browser_open may not require logging in again.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
     ];
   }
 
+  // Intersight managed-object boilerplate that is almost never useful to an
+  // agent but dominates result size (arrays of MoRefs, redundant IDs). Stripped
+  // from every tool result to cut token usage. See slimResult().
+  private static readonly BOILERPLATE_KEYS = new Set<string>([
+    'Ancestors',
+    'PermissionResources',
+    'Owners',
+    'VersionContext',
+    'SharedScope',
+    'DomainGroupMoid',
+    'AccountMoid',
+    'InterClusterLinkState',
+  ]);
+
+  /** The default max rows returned from any list/search result (env-overridable; 0 disables). */
+  private listCap(): number {
+    const raw = Number(process.env.INTERSIGHT_LIST_CAP);
+    return Number.isFinite(raw) ? raw : 50;
+  }
+
+  /**
+   * Public tool-call entry. Dispatches, then slims the result to control token
+   * usage: strips heavy boilerplate fields from every managed object and caps
+   * oversized `.Results` arrays. Image content (__mcpContent) passes through
+   * untouched. Internal apiService calls made inside handlers are NOT affected —
+   * only the final value returned to the model.
+   */
   private async handleToolCall(name: string, args: Record<string, any>): Promise<any> {
+    const raw = await this.dispatchToolCall(name, args);
+    return this.slimResult(raw);
+  }
+
+  /** Recursively drop boilerplate keys and MoRef `link` URLs from a result tree. */
+  private stripBoilerplate(node: any): any {
+    if (Array.isArray(node)) {
+      return node.map((n) => this.stripBoilerplate(n));
+    }
+    if (node && typeof node === 'object') {
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(node)) {
+        if (IntersightMCPServer.BOILERPLATE_KEYS.has(k)) {
+          continue;
+        }
+        // MoRefs carry an absolute `link` URL that is redundant with Moid.
+        if (k === 'link' && typeof v === 'string' && v.startsWith('http')) {
+          continue;
+        }
+        out[k] = this.stripBoilerplate(v);
+      }
+      return out;
+    }
+    return node;
+  }
+
+  private slimResult(result: any): any {
+    if (!result || typeof result !== 'object') {
+      return result;
+    }
+    // Never touch rich MCP content (screenshots etc.).
+    if (Array.isArray((result as any).__mcpContent)) {
+      return result;
+    }
+    const slimmed = this.stripBoilerplate(result);
+    const cap = this.listCap();
+    if (cap > 0 && slimmed && Array.isArray(slimmed.Results) && slimmed.Results.length > cap) {
+      const total = slimmed.Results.length;
+      slimmed.Results = slimmed.Results.slice(0, cap);
+      slimmed._truncated = {
+        returnedRows: cap,
+        totalRows: total,
+        note: `Result capped to ${cap} rows to save tokens. Narrow it with an OData 'filter' (or raise the cap via INTERSIGHT_LIST_CAP) to get exactly the rows you need.`,
+      };
+    }
+    return slimmed;
+  }
+
+  private async dispatchToolCall(name: string, args: Record<string, any>): Promise<any> {
     switch (name) {
       // Inventory & Discovery
       case 'list_compute_servers':
@@ -4318,7 +4774,12 @@ export class IntersightMCPServer {
 
       // Profile Management
       case 'list_server_profiles':
-        return this.apiService.listServerProfiles();
+        return this.apiService.listServerProfiles({
+          filter: args.filter,
+          select: args.select,
+          top: args.top,
+          orderby: args.orderby,
+        });
       
       case 'get_server_profile':
         return this.apiService.getServerProfile(args.moid);
@@ -4641,8 +5102,291 @@ export class IntersightMCPServer {
         console.error(`   - All affected devices tracked and resolved by name`);
         return report;
 
+      // Browser & vKVM (interactive user session)
+      case 'browser_open':
+        return this.getBrowserService().open(
+          args.url,
+          args.width && args.height ? { width: args.width, height: args.height } : undefined
+        );
+
+      case 'browser_status':
+        return this.getBrowserService().status();
+
+      case 'browser_login':
+        return this.getBrowserService().ensureLoggedIn({ force: args.force });
+
+      case 'launch_vkvm_session': {
+        const server = await this.resolvePhysicalServer(args.serverMoid);
+        return this.getBrowserService().launchVkvm(server, { forceNew: args.forceNew });
+      }
+
+      case 'browser_screenshot': {
+        const shot = await this.getBrowserService().screenshot({
+          serverMoid: args.serverMoid,
+          fullPage: args.fullPage,
+        });
+        return {
+          __mcpContent: [
+            { type: 'image', data: shot.base64, mimeType: 'image/png' },
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { path: shot.path, url: shot.url, changeSinceLastShot: shot.changeSinceLastShot },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case 'browser_send_keys':
+        return this.getBrowserService().sendKeys({
+          serverMoid: args.serverMoid,
+          text: args.text,
+          keys: args.keys,
+        });
+
+      case 'browser_mouse':
+        return this.getBrowserService().mouse({
+          serverMoid: args.serverMoid,
+          x: args.x,
+          y: args.y,
+          action: args.action,
+          button: args.button,
+          relativeTo: args.relativeTo,
+        });
+
+      case 'browser_goto':
+        return this.getBrowserService().goto(args.url, args.newPage);
+
+      case 'browser_evaluate':
+        return this.getBrowserService().evaluate(args.script, args.serverMoid);
+
+      case 'browser_intersight_api':
+        return this.getBrowserService().sessionApi(args.method, args.path, args.body);
+
+      case 'vkvm_recent':
+        return this.getBrowserService().getRecentFrames(
+          args.serverMoid,
+          args.count,
+          args.scale,
+          args.changesOnly !== false
+        );
+
+      case 'vkvm_frames_at':
+        return this.getBrowserService().getFramesAt(args.serverMoid, {
+          at: args.at,
+          secondsAgo: args.secondsAgo,
+          before: args.before,
+          after: args.after,
+          scale: args.scale,
+        });
+
+      case 'vkvm_timeline':
+        return this.getBrowserService().getTimeline(args.serverMoid, args.minutesAgo);
+
+      case 'vkvm_record_start':
+        return this.getBrowserService().startRecording(args.serverMoid, {
+          intervalMs: args.intervalMs,
+          retentionMinutes: args.retentionMinutes,
+          maxFrames: args.maxFrames,
+          threshold: args.threshold,
+          heartbeatSeconds: args.heartbeatSeconds,
+          antiBlankSeconds: args.antiBlankSeconds,
+          antiBlankMode: args.antiBlankMode,
+        });
+
+      case 'vkvm_record_stop':
+        return this.getBrowserService().stopRecording(args.serverMoid);
+
+      case 'vkvm_record_status':
+        return this.getBrowserService().recordingStatus(args.serverMoid);
+
+      case 'vkvm_wait': {
+        const r = await this.getBrowserService().waitForFrame({
+          serverMoid: args.serverMoid,
+          mode: args.mode,
+          timeoutMs: args.timeoutMs,
+          intervalMs: args.intervalMs,
+          stablePeriodMs: args.stablePeriodMs,
+          threshold: args.threshold,
+        });
+        const { base64, ...meta } = r;
+        return {
+          __mcpContent: [
+            { type: 'image', data: base64, mimeType: 'image/png' },
+            { type: 'text', text: JSON.stringify(meta, null, 2) },
+          ],
+        };
+      }
+
+      case 'vkvm_press_until': {
+        const r = await this.getBrowserService().pressUntil({
+          serverMoid: args.serverMoid,
+          keys: args.keys,
+          intervalMs: args.intervalMs,
+          timeoutMs: args.timeoutMs,
+          stopOn: args.stopOn,
+          stablePeriodMs: args.stablePeriodMs,
+          threshold: args.threshold,
+        });
+        const { base64, ...meta } = r;
+        return {
+          __mcpContent: [
+            { type: 'image', data: base64, mimeType: 'image/png' },
+            { type: 'text', text: JSON.stringify(meta, null, 2) },
+          ],
+        };
+      }
+
+      case 'vkvm_watch': {
+        const r = await this.getBrowserService().watch({
+          serverMoid: args.serverMoid,
+          durationMs: args.durationMs,
+          intervalMs: args.intervalMs,
+          threshold: args.threshold,
+          saveChangeFrames: args.saveChangeFrames,
+        });
+        const { firstBase64, lastBase64, ...meta } = r;
+        return {
+          __mcpContent: [
+            { type: 'text', text: `First frame (t=0) and last frame (t=${r.durationMs}ms):` },
+            { type: 'image', data: firstBase64, mimeType: 'image/png' },
+            { type: 'image', data: lastBase64, mimeType: 'image/png' },
+            { type: 'text', text: JSON.stringify(meta, null, 2) },
+          ],
+        };
+      }
+
+      case 'close_vkvm_session':
+        return this.getBrowserService().closeKvm(args.serverMoid);
+
+      case 'reset_tunneled_vkvm':
+        return this.resetTunneledVkvm(args.serverMoid);
+
+      case 'browser_close':
+        return this.getBrowserService().close();
+
       default:
         throw new Error(`Unknown tool: ${name}`);
+    }
+  }
+
+  private getBrowserService(): BrowserService {
+    if (!this.browserService) {
+      this.browserService = new BrowserService(loadConfig().baseUrl);
+    }
+    return this.browserService;
+  }
+
+  /**
+   * Workaround for an Intersight bug where launching a tunneled vKVM session
+   * immediately shows "KVM session has ended": disable Tunneled vKVM on the
+   * server and re-enable it. Implemented by PATCHing
+   * compute.ServerSetting.TunneledKvmState with the action values
+   * 'Disable' / 'Enable' (each spawns an "Update Tunneled vKVM" workflow that
+   * must complete before the next step).
+   */
+  private async resetTunneledVkvm(serverMoid: string): Promise<any> {
+    const server = await this.resolvePhysicalServer(serverMoid);
+
+    const settingsList = await this.apiService.get(
+      `/compute/ServerSettings?$filter=Server.Moid eq '${serverMoid}'&$select=Moid,TunneledKvmState`
+    );
+    const setting = settingsList?.Results?.[0];
+    if (!setting?.Moid) {
+      throw new Error(`No compute.ServerSetting found for server ${serverMoid} (${server.name ?? 'unknown'})`);
+    }
+
+    // In-progress workflow states (compared case-insensitively for robustness).
+    const IN_PROGRESS = new Set(['RUNNING', 'WAITING', 'NO_OP', 'INPROGRESS', 'PENDING', 'SCHEDULED']);
+
+    const applyState = async (state: 'Disable' | 'Enable'): Promise<any> => {
+      const patched = await this.apiService.patch(`/compute/ServerSettings/${setting.Moid}`, {
+        TunneledKvmState: state,
+      });
+      const workflowMoid = patched?.RunningWorkflow?.Moid;
+      if (!workflowMoid) {
+        // No workflow reference came back. Don't claim success — re-read the
+        // setting so the caller can see the actual observed state.
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        const check = await this.apiService
+          .get(`/compute/ServerSettings/${setting.Moid}?$select=TunneledKvmState`)
+          .catch(() => null);
+        return {
+          state,
+          workflowObserved: false,
+          observedTunneledKvmState: check?.TunneledKvmState ?? 'unknown',
+          warning: `No RunningWorkflow was returned for the ${state} PATCH; completion could not be confirmed by workflow polling.`,
+        };
+      }
+      // Poll the "Update Tunneled vKVM" workflow until it finishes (~15s each).
+      const deadline = Date.now() + 120000;
+      let status = 'RUNNING';
+      while (Date.now() < deadline) {
+        const wf = await this.apiService.get(`/workflow/WorkflowInfos/${workflowMoid}?$select=Status,Progress`);
+        status = wf?.Status ?? 'UNKNOWN';
+        if (!IN_PROGRESS.has(String(status).toUpperCase())) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+      if (String(status).toUpperCase() !== 'COMPLETED') {
+        throw new Error(`Tunneled vKVM ${state} workflow ${workflowMoid} ended with status ${status}`);
+      }
+      return { state, workflowObserved: true, workflowMoid, status };
+    };
+
+    const disable = await applyState('Disable');
+    const enable = await applyState('Enable');
+    // Verified live: relaunching immediately after the Enable workflow completes
+    // still hits "KVM session has ended" - the KVM service needs time to settle.
+    await new Promise((resolve) => setTimeout(resolve, 30000));
+    const workflowsConfirmed = disable.workflowObserved && enable.workflowObserved;
+    return {
+      server: { Moid: server.moid, ObjectType: server.objectType, Name: server.name },
+      serverSettingMoid: setting.Moid,
+      previousTunneledKvmState: setting.TunneledKvmState,
+      disable,
+      enable,
+      workflowsConfirmed,
+      note: workflowsConfirmed
+        ? 'Tunneled vKVM was disabled, re-enabled, and given 30s to settle. Launch the vKVM session again; if it still shows "KVM session has ended", retry the reset.'
+        : 'Tunneled vKVM PATCHes were sent but at least one workflow could not be confirmed (see warnings). Verify the console launches; re-run reset_tunneled_vkvm if it is still dead.',
+    };
+  }
+
+  /**
+   * Resolve a physical server MOID to its concrete type (compute.RackUnit or
+   * compute.Blade) and name, as required for the kvm.Tunnel/kvm.Session
+   * Server reference.
+   */
+  private async resolvePhysicalServer(moid: string): Promise<{ moid: string; objectType: string; name?: string }> {
+    if (!moid) {
+      throw new Error('serverMoid is required');
+    }
+    // Only a genuine 404 means "wrong object type, try the other". A 401/403/500/
+    // timeout must NOT be silently treated as not-found, or a transient blip gets
+    // misreported as an invalid MOID.
+    const isNotFound = (err: any): boolean => /(^|[^0-9])404([^0-9]|$)/.test(String(err?.message ?? err));
+
+    try {
+      const rackUnit = await this.apiService.get(`/compute/RackUnits/${moid}?$select=Name`);
+      return { moid, objectType: 'compute.RackUnit', name: rackUnit?.Name };
+    } catch (err) {
+      if (!isNotFound(err)) {
+        throw err;
+      }
+    }
+    try {
+      const blade = await this.apiService.get(`/compute/Blades/${moid}?$select=Name`);
+      return { moid, objectType: 'compute.Blade', name: blade?.Name };
+    } catch (err) {
+      if (!isNotFound(err)) {
+        throw err;
+      }
+      throw new Error(`Server ${moid} was not found as a compute.RackUnit or compute.Blade. If this MOID came from compute/PhysicalSummaries, it should match the underlying server object; verify the MOID.`);
     }
   }
 

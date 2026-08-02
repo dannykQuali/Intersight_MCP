@@ -1,0 +1,7 @@
+{
+  "_comment": "Template for unattended Cisco ID login. Copy to a file OUTSIDE the repo (or to intersight-sso.json, which is gitignored), fill it in, and point INTERSIGHT_SSO_CREDENTIALS_FILE at it. Restrict permissions so only you can read it. See docs/UNATTENDED_LOGIN.md.",
+  "username": "you@example.com",
+  "password": "your-cisco-id-password",
+  "totp": "otpauth://totp/id.cisco.com:you%40example.com?secret=YOURBASE32SECRET&issuer=Cisco&algorithm=SHA1&digits=6&period=30",
+  "accountName": "Your-Intersight-Account-Name"
+}

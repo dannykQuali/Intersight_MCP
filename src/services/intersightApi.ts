@@ -29,6 +29,38 @@ export interface IntersightConfig {
   baseUrl: string;
 }
 
+export interface ODataOptions {
+  filter?: string;
+  select?: string;
+  top?: number;
+  orderby?: string;
+}
+
+/**
+ * Build an OData query string ("?$filter=...&$select=...") from options.
+ * Lets callers scope list results at the API level ($select/$top) so Intersight
+ * returns fewer bytes rather than fetching everything and trimming afterward.
+ */
+export function buildODataQuery(opts?: ODataOptions): string {
+  if (!opts) {
+    return '';
+  }
+  const parts: string[] = [];
+  if (opts.filter) {
+    parts.push(`$filter=${encodeURIComponent(opts.filter)}`);
+  }
+  if (opts.select) {
+    parts.push(`$select=${encodeURIComponent(opts.select)}`);
+  }
+  if (typeof opts.top === 'number' && opts.top > 0) {
+    parts.push(`$top=${Math.floor(opts.top)}`);
+  }
+  if (opts.orderby) {
+    parts.push(`$orderby=${encodeURIComponent(opts.orderby)}`);
+  }
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
 export class IntersightApiService {
   private config: IntersightConfig;
 
@@ -216,8 +248,8 @@ export class IntersightApiService {
   }
 
   // Profiles
-  async listServerProfiles(): Promise<any> {
-    return this.get('/server/Profiles');
+  async listServerProfiles(opts?: { filter?: string; select?: string; top?: number; orderby?: string }): Promise<any> {
+    return this.get(`/server/Profiles${buildODataQuery(opts)}`);
   }
 
   async getServerProfile(moid: string): Promise<any> {

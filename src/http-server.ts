@@ -71,6 +71,17 @@ async function executeTool(name: string, args: Record<string, any>): Promise<any
   return (mcpServer as any).handleToolCall(name, args);
 }
 
+// Normalize a tool result for HTTP: image tools return the internal
+// { __mcpContent: [...] } sentinel (used by the stdio CallTool handler). Unwrap
+// it to the MCP-standard { content: [...] } shape so HTTP clients get the same
+// typed image/text content instead of the raw private marker.
+function toHttpResult(result: any): any {
+  if (result && typeof result === 'object' && Array.isArray(result.__mcpContent)) {
+    return { content: result.__mcpContent };
+  }
+  return result;
+}
+
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   res.json({
@@ -183,12 +194,12 @@ app.post('/api/execute', async (req: Request, res: Response) => {
 
     // Execute the tool
     const result = await executeTool(tool, parameters);
-    
+
     res.json({
       success: true,
       tool: tool,
       parameters: parameters,
-      result: result,
+      result: toHttpResult(result),
       timestamp: new Date().toISOString()
     });
 
@@ -223,7 +234,7 @@ app.post('/api/batch', async (req: Request, res: Response) => {
         results.push({
           success: true,
           tool: operation.tool,
-          result: result
+          result: toHttpResult(result)
         });
       } catch (error) {
         results.push({

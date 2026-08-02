@@ -2820,7 +2820,7 @@ export class IntersightMCPServer {
       // Search & Query Tools
       {
         name: 'search_resources',
-        description: 'Search for resources by type with optional OData filters',
+        description: 'Search for resources by type with OData options. Use select/top as FIRST-CLASS parameters — do not append "&$select=..." to filter, which cannot work (filter is URL-encoded as one value, so the & would be escaped into the expression). Prefer this with a filter over a bare list_* call: it is far cheaper in tokens.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2830,7 +2830,19 @@ export class IntersightMCPServer {
             },
             filter: {
               type: 'string',
-              description: 'OData filter expression',
+              description: "OData $filter expression, e.g. \"Name eq 'C240-WZP26220B5F'\"",
+            },
+            select: {
+              type: 'string',
+              description: "OData $select — comma-separated fields, e.g. 'Name,Moid,OperPowerState'. Greatly reduces response size.",
+            },
+            top: {
+              type: 'number',
+              description: 'OData $top — maximum number of rows to return.',
+            },
+            orderby: {
+              type: 'string',
+              description: "OData $orderby, e.g. 'Name asc'.",
             },
           },
           required: ['resourceType'],
@@ -3748,6 +3760,14 @@ export class IntersightMCPServer {
             intervalMs: { type: 'number', description: 'Sampling interval in ms (default: 500)' },
             stablePeriodMs: { type: 'number', description: 'For mode "stable": how long the frame must stay quiet to count as stable (default: 3000)' },
             threshold: { type: 'number', description: 'Fraction of pixels (0..1) that must differ to count as a change (default: 0.01)' },
+            untilText: {
+              type: 'string',
+              description: 'Keep waiting until the SETTLED screen matches this regex (read via OCR), e.g. "login:|Press any key". Lets you sleep through healthy phases: a boot that pauses repeatedly will not wake you until the screen you asked for appears.',
+            },
+            differentFromPath: {
+              type: 'string',
+              description: 'Keep waiting until the settled screen DIFFERS from this reference frame (a PNG path from vkvm_recent/vkvm_timeline). Use with mode "stable" for "wake me when it settles on something new".',
+            },
           },
         },
       },
@@ -3812,8 +3832,32 @@ export class IntersightMCPServer {
           properties: {
             serverMoid: { type: 'string', description: 'MOID of the recorded server' },
             minutesAgo: { type: 'number', description: 'Only events from the last N minutes (default: all retained)' },
+            minChangeRatio: {
+              type: 'number',
+              description: 'Only frames whose change magnitude is at least this (0..1). Cuts progress-bar noise: during an install most frames tick at ~0.001, while the events worth seeing (reboot, mode switch, error dialog) are 0.1-0.9. Try 0.05 to see only structural changes.',
+            },
           },
           required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_find_text',
+        description: 'Search the RECORDED console frames for text using OCR, spending NO image tokens. This is the cheap way to answer "did something go wrong while I was not looking" — e.g. pattern "ERROR|FAILED|panic|press any key" detects a parked installer or a crashed boot without looking at a single screenshot. Scans newest-first and stops at the first few matches. Returns each match with its timestamp and frame path; follow up with vkvm_frames_at to actually see that moment. Note: prominent text (dialogs, headings, full-screen messages) reads reliably; small UI chrome may not.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            pattern: {
+              type: 'string',
+              description: 'Regular expression to search for, e.g. "ERROR|FAILED|fatal" or "press any key". Case-insensitive by default.',
+            },
+            lastN: { type: 'number', description: 'Only consider the newest N recorded frames' },
+            minutesAgo: { type: 'number', description: 'Only consider frames from the last N minutes' },
+            maxFrames: { type: 'number', description: 'Hard cap on frames to OCR (default 25, max 80). Each frame costs ~0.6-1.4s.' },
+            maxMatches: { type: 'number', description: 'Stop after this many matches (default 5)' },
+            ignoreCase: { type: 'boolean', description: 'Case-insensitive matching (default true)' },
+          },
+          required: ['serverMoid', 'pattern'],
         },
       },
       {
@@ -3824,7 +3868,7 @@ export class IntersightMCPServer {
           properties: {
             serverMoid: { type: 'string', description: 'MOID of the server whose console to record' },
             intervalMs: { type: 'number', description: 'Sampling interval in ms (default 1000, minimum 250)' },
-            retentionMinutes: { type: 'number', description: 'How long to keep frames (default 120)' },
+            retentionMinutes: { type: 'number', description: 'How long to keep frames, in minutes (default 240 = 4h, sized so a long OS install fits). Raise it for installs longer than that; budget roughly 10MB per hour per idle console.' },
             maxFrames: { type: 'number', description: 'Hard cap on retained frames (default 3000)' },
             threshold: { type: 'number', description: 'Change fraction that counts as a real change (default 0.002)' },
             heartbeatSeconds: { type: 'number', description: 'Store a frame at least this often even when idle (default 60)' },
@@ -3852,10 +3896,15 @@ export class IntersightMCPServer {
       },
       {
         name: 'vkvm_record_status',
-        description: 'Report recording state: frames stored, disk used, capture errors, and how many console changes have occurred since you last viewed frames.',
+        description: 'Report recording state: frames stored, disk used, capture errors, recoveries/wakes, retention window, and how many console changes occurred since you last viewed frames. OMIT serverMoid to LIST EVERY ACTIVE RECORDER — use this to rediscover which servers you are recording after losing track (e.g. after context compaction); the returned serverMoid values are what the other vkvm_* tools take.',
         inputSchema: {
           type: 'object',
-          properties: { serverMoid: { type: 'string', description: 'Omit to report every recorder' } },
+          properties: {
+            serverMoid: {
+              type: 'string',
+              description: 'Omit to list ALL recorders (recommended when you need to rediscover what is being recorded)',
+            },
+          },
         },
       },
       {
@@ -4837,7 +4886,11 @@ export class IntersightMCPServer {
 
       // Search & Query
       case 'search_resources':
-        return this.apiService.searchResources(args.resourceType, args.filter);
+        return this.apiService.searchResources(args.resourceType, args.filter, {
+          select: args.select,
+          top: args.top,
+          orderby: args.orderby,
+        });
 
       // Telemetry & Metrics
       case 'get_server_telemetry':
@@ -5184,7 +5237,17 @@ export class IntersightMCPServer {
         });
 
       case 'vkvm_timeline':
-        return this.getBrowserService().getTimeline(args.serverMoid, args.minutesAgo);
+        return this.getBrowserService().getTimeline(args.serverMoid, args.minutesAgo, args.minChangeRatio);
+
+      case 'vkvm_find_text':
+        return this.getBrowserService().findTextInFrames(args.serverMoid, {
+          pattern: args.pattern,
+          lastN: args.lastN,
+          minutesAgo: args.minutesAgo,
+          maxFrames: args.maxFrames,
+          maxMatches: args.maxMatches,
+          ignoreCase: args.ignoreCase,
+        });
 
       case 'vkvm_record_start':
         return this.getBrowserService().startRecording(args.serverMoid, {
@@ -5211,6 +5274,8 @@ export class IntersightMCPServer {
           intervalMs: args.intervalMs,
           stablePeriodMs: args.stablePeriodMs,
           threshold: args.threshold,
+          untilText: args.untilText,
+          differentFromPath: args.differentFromPath,
         });
         const { base64, ...meta } = r;
         return {

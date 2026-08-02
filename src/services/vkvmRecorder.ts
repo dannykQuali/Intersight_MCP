@@ -83,7 +83,11 @@ export interface RecorderHooks {
 export interface RecorderOptions {
   /** How often to sample the console. Default 1000ms. */
   intervalMs?: number;
-  /** Drop frames older than this. Default 120 minutes. */
+  /**
+   * Drop frames older than this. Default 240 minutes (4h) so a long OS install
+   * fits in the buffer — a 3-hour Windows install overflowed the previous 120m
+   * default and lost its early history. Costs ~40MB/server for an idle console.
+   */
   retentionMinutes?: number;
   /** Hard cap on retained frames (protects disk). Default 3000. */
   maxFrames?: number;
@@ -231,7 +235,7 @@ export class VkvmRecorder {
     this.hooks = hooks ?? {};
     this.opts = {
       intervalMs: Math.max(250, opts?.intervalMs ?? 1000),
-      retentionMinutes: opts?.retentionMinutes ?? 120,
+      retentionMinutes: opts?.retentionMinutes ?? 240,
       maxFrames: opts?.maxFrames ?? 3000,
       threshold: opts?.threshold ?? 0.0005,
       heartbeatSeconds: opts?.heartbeatSeconds ?? 60,
@@ -617,6 +621,20 @@ export class VkvmRecorder {
     this.lastViewedSeq = Math.max(this.lastViewedSeq, target);
   }
 
+  /**
+   * Frames to search over, NEWEST FIRST so a text scan hits recent events soonest
+   * and can stop early. Heartbeats are included: a parked installer produces no
+   * changes, so its telltale text may only exist on a heartbeat frame.
+   */
+  framesForSearch(lastN?: number, sinceMs?: number): RecordedFrame[] {
+    let pool = this.frames;
+    if (typeof sinceMs === 'number') {
+      pool = pool.filter((f) => f.at >= sinceMs);
+    }
+    const newestFirst = [...pool].reverse();
+    return typeof lastN === 'number' && lastN > 0 ? newestFirst.slice(0, lastN) : newestFirst;
+  }
+
   /** The most recent frames, newest last. `changesOnly` skips heartbeats. */
   recent(count: number, changesOnly = false): RecordedFrame[] {
     const pool = changesOnly ? this.frames.filter((f) => f.reason !== 'heartbeat') : this.frames;
@@ -647,7 +665,7 @@ export class VkvmRecorder {
    * tokens. Console outages and recoveries are interleaved with the frames, so
    * a gap in the recording is explicit rather than looking like a quiet machine.
    */
-  timeline(sinceMs?: number): Array<{
+  timeline(sinceMs?: number, minChangeRatio?: number): Array<{
     seq?: number;
     at: string;
     sinceStartSec: number;
@@ -657,8 +675,18 @@ export class VkvmRecorder {
     path?: string;
   }> {
     const from = sinceMs ?? 0;
+    // minChangeRatio filters out progress-bar noise (installs emit dozens of
+    // ~0.001 ticks) so the big structural events — reboot, mode switch, error
+    // dialog — stand out. 'first' frames are always kept as anchors, and
+    // heartbeats are dropped when filtering since they carry no change.
     const frameRows = this.frames
       .filter((f) => f.at >= from)
+      .filter((f) => {
+        if (minChangeRatio === undefined || minChangeRatio <= 0) {
+          return true;
+        }
+        return f.reason === 'first' || f.changeRatio >= minChangeRatio;
+      })
       .map((f) => ({
         seq: f.seq,
         at: f.at,

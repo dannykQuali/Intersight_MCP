@@ -28,6 +28,7 @@ import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import { loadSsoConfig, SsoConfig } from '../utils/config.js';
 import { VkvmRecorder, RecordedFrame, RecorderOptions } from './vkvmRecorder.js';
+import { FrameOcr } from './frameOcr.js';
 import { generateTotp, parseTotpConfig, secondsRemainingInWindow, TotpParams } from '../utils/totp.js';
 
 export interface SessionApiResult {
@@ -83,6 +84,8 @@ export class BrowserService {
   // Continuous console recorders, one per server MOID.
   private recorders = new Map<string, VkvmRecorder>();
   private readonly recordingDir: string;
+  /** Lazy OCR over recorded frames; shared cache across searches. */
+  private frameOcr = new FrameOcr();
   // Server descriptors for consoles we have launched, so a recorder can
   // relaunch the same console after a session timeout without the caller.
   private kvmServers = new Map<string, { moid: string; objectType: string; name?: string }>();
@@ -1709,27 +1712,85 @@ export class BrowserService {
     intervalMs?: number;
     stablePeriodMs?: number;
     threshold?: number;
+    /** Keep waiting until the settled screen's text matches this regex (OCR). */
+    untilText?: string;
+    /** Keep waiting until the settled screen differs from this reference frame. */
+    differentFromPath?: string;
   }): Promise<any> {
     const page = this.resolvePage(opts.serverMoid);
     const mode = opts.mode ?? 'change';
-    const r = await this.sampleLoop(page, {
-      mode,
-      timeoutMs: opts.timeoutMs ?? 60000,
-      intervalMs: opts.intervalMs ?? 500,
-      threshold: opts.threshold ?? 0.01,
-      stablePeriodMs: opts.stablePeriodMs ?? 3000,
-    });
-    const filePath = this.saveFrame(r.finalBuf, `wait-${mode}`);
-    this.lastShot.set(page, { buf: r.finalBuf, t: Date.now() });
+    const deadline = Date.now() + (opts.timeoutMs ?? 60000);
+
+    let textRe: RegExp | null = null;
+    if (opts.untilText) {
+      try {
+        textRe = new RegExp(opts.untilText, 'i');
+      } catch (error) {
+        throw new Error(`Invalid untilText pattern: ${(error as Error).message}`);
+      }
+    }
+    const referenceBuf = opts.differentFromPath
+      ? await fs.promises.readFile(opts.differentFromPath).catch(() => null)
+      : null;
+    if (opts.differentFromPath && !referenceBuf) {
+      throw new Error(`Could not read reference frame: ${opts.differentFromPath}`);
+    }
+
+    // With a predicate, "settled" is not enough: keep sampling until the screen
+    // ALSO satisfies it. This is what lets an agent sleep through healthy
+    // phases — a boot that pauses repeatedly no longer wakes it each time.
+    let r: Awaited<ReturnType<typeof this.sampleLoop>> | null = null;
+    let rounds = 0;
+    let predicateMet = !textRe && !referenceBuf;
+    let ocrText: string | null = null;
+    let refDiff: number | null = null;
+
+    while (Date.now() < deadline) {
+      rounds++;
+      r = await this.sampleLoop(page, {
+        mode,
+        timeoutMs: Math.max(1000, deadline - Date.now()),
+        intervalMs: opts.intervalMs ?? 500,
+        threshold: opts.threshold ?? 0.01,
+        stablePeriodMs: opts.stablePeriodMs ?? 3000,
+      });
+      if (!textRe && !referenceBuf) {
+        break; // no predicate: original behaviour
+      }
+      if (r.outcome === 'timeout') {
+        break;
+      }
+      let ok = true;
+      if (referenceBuf) {
+        refDiff = this.frameDiffRatio(referenceBuf, r.finalBuf);
+        ok = ok && refDiff > (opts.threshold ?? 0.01);
+      }
+      if (ok && textRe) {
+        ocrText = await this.frameOcr.textOfBuffer(r.finalBuf);
+        ok = ocrText !== null && textRe.test(ocrText);
+      }
+      if (ok) {
+        predicateMet = true;
+        break;
+      }
+    }
+
+    const finalBuf = r!.finalBuf;
+    const filePath = this.saveFrame(finalBuf, `wait-${mode}`);
+    this.lastShot.set(page, { buf: finalBuf, t: Date.now() });
     return {
       mode,
-      outcome: r.outcome,
-      elapsedMs: r.elapsedMs,
-      maxChangeRatio: r.maxChangeRatio,
-      sawChange: r.sawChange,
-      samples: r.samples,
+      outcome: predicateMet ? r!.outcome : 'timeout',
+      predicate: textRe || referenceBuf ? { met: predicateMet, rounds } : undefined,
+      ...(textRe ? { untilText: opts.untilText, ocrSample: (ocrText ?? '').slice(0, 200) } : {}),
+      ...(referenceBuf ? { differenceFromReference: refDiff } : {}),
+      ...(textRe && this.frameOcr.isUnavailable() ? { ocrUnavailable: this.frameOcr.isUnavailable() } : {}),
+      elapsedMs: r!.elapsedMs,
+      maxChangeRatio: r!.maxChangeRatio,
+      sawChange: r!.sawChange,
+      samples: r!.samples,
       path: filePath,
-      base64: r.finalBuf.toString('base64'),
+      base64: finalBuf.toString('base64'),
       url: page.url(),
     };
   }
@@ -2191,11 +2252,89 @@ export class BrowserService {
     return { __mcpContent: this.framesToContent(frames, scale, header) };
   }
 
+  /**
+   * Search recorded frames for text, WITHOUT spending image tokens.
+   *
+   * The motivating case: a long install parks on an error or a "press any key"
+   * prompt and nothing changes afterwards, so change-detection reports a calm
+   * machine while hours are lost. Asking "did FAILED appear in the last hour"
+   * answers that in text alone.
+   *
+   * Scans newest-first and stops at `maxMatches`, so the common "is anything
+   * wrong right now" query only OCRs a handful of frames.
+   */
+  async findTextInFrames(
+    serverMoid: string,
+    opts: { pattern: string; lastN?: number; minutesAgo?: number; maxFrames?: number; maxMatches?: number; ignoreCase?: boolean }
+  ): Promise<any> {
+    const recorder = this.requireRecorder(serverMoid);
+    let re: RegExp;
+    try {
+      re = new RegExp(opts.pattern, opts.ignoreCase === false ? '' : 'i');
+    } catch (error) {
+      throw new Error(`Invalid search pattern: ${(error as Error).message}`);
+    }
+
+    const since = typeof opts.minutesAgo === 'number' ? Date.now() - opts.minutesAgo * 60000 : undefined;
+    const candidates = recorder.framesForSearch(opts.lastN, since);
+    const cap = Math.max(1, Math.min(opts.maxFrames ?? 25, 80));
+    const maxMatches = Math.max(1, opts.maxMatches ?? 5);
+    const toScan = candidates.slice(0, cap);
+
+    const started = Date.now();
+    const matches: any[] = [];
+    let scanned = 0;
+    let ocrFailures = 0;
+
+    for (const frame of toScan) {
+      const text = await this.frameOcr.textOf(frame.path);
+      scanned++;
+      if (text === null) {
+        ocrFailures++;
+        continue;
+      }
+      const hit = re.exec(text);
+      if (hit) {
+        const at = Math.max(0, hit.index - 60);
+        matches.push({
+          seq: frame.seq,
+          at: new Date(frame.at).toISOString(),
+          secondsAgo: Math.round((Date.now() - frame.at) / 1000),
+          matched: hit[0].slice(0, 80),
+          context: text.slice(at, at + 200),
+          changeRatio: frame.changeRatio,
+          reason: frame.reason,
+          path: frame.path,
+        });
+        if (matches.length >= maxMatches) {
+          break;
+        }
+      }
+    }
+
+    const unavailable = this.frameOcr.isUnavailable();
+    return {
+      serverMoid,
+      pattern: opts.pattern,
+      found: matches.length > 0,
+      matches, // newest first
+      framesScanned: scanned,
+      framesAvailable: candidates.length,
+      elapsedMs: Date.now() - started,
+      ...(unavailable ? { ocrUnavailable: unavailable } : {}),
+      ...(ocrFailures ? { framesOcrFailed: ocrFailures } : {}),
+      note:
+        matches.length > 0
+          ? 'Matches are newest-first. Use vkvm_frames_at with the timestamp to SEE that moment.'
+          : `No match in the ${scanned} most recent frame(s) scanned. Widen with lastN/minutesAgo/maxFrames, or the text may be too small for OCR (prominent dialog text reads reliably; small chrome does not).`,
+    };
+  }
+
   /** Cheap text-only change history. */
-  getTimeline(serverMoid: string, minutesAgo?: number): any {
+  getTimeline(serverMoid: string, minutesAgo?: number, minChangeRatio?: number): any {
     const recorder = this.requireRecorder(serverMoid);
     const since = typeof minutesAgo === 'number' ? Date.now() - minutesAgo * 60000 : undefined;
-    const all = recorder.timeline(since);
+    const all = recorder.timeline(since, minChangeRatio);
     // Keep the response cheap: a long run can accumulate thousands of events.
     const MAX_EVENTS = 200;
     const events = all.length > MAX_EVENTS ? all.slice(-MAX_EVENTS) : all;

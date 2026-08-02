@@ -287,11 +287,19 @@ export class IntersightApiService {
   }
 
   // Search
-  async searchResources(resourceType: string, filter?: string): Promise<any> {
-    const endpoint = filter
-      ? `/${resourceType}?$filter=${encodeURIComponent(filter)}`
-      : `/${resourceType}`;
-    return this.get(endpoint);
+  /**
+   * Query any resource type with OData options.
+   *
+   * select/top/orderby are FIRST-CLASS parameters: appending them to `filter`
+   * cannot work, because the filter is URL-encoded as a single value and the
+   * '&' would be escaped into the filter expression itself.
+   */
+  async searchResources(
+    resourceType: string,
+    filter?: string,
+    opts?: { select?: string; top?: number; orderby?: string }
+  ): Promise<any> {
+    return this.get(`/${resourceType}${buildODataQuery({ filter, ...opts })}`);
   }
 
   // Telemetry & Metrics

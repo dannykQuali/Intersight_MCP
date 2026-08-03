@@ -100,9 +100,9 @@ Recording starts **automatically** with `launch_vkvm_session` (disable with `INT
 | `vkvm_timeline {serverMoid, minutesAgo}` | Text-only change history — **no image tokens**. Find *when* something happened, then look at it. |
 | `vkvm_record_start` / `_stop` / `_status` | Manual control, tuning, disk/error stats. |
 
-**Observed capacity (measured over a multi-hour run).** With the defaults (1s sampling, 60s heartbeat, 120-minute retention) a mostly-idle 1600×900 console settles at roughly **20MB and ~170 frames per server**, reached after about two hours and flat thereafter — pruning holds it there. A second recorder on a static console plateaued near 6MB. Budget per *recorded server*, not per session.
+**Observed capacity (measured over a multi-hour run).** With 1s sampling and a 60s heartbeat a mostly-idle 1600×900 console settles at roughly **20MB and ~170 frames per server**, reached after about two hours and flat thereafter — pruning holds it there. A second recorder on a static console plateaued near 6MB. Budget per *recorded server*, not per session.
 
-**Storage is change-triggered, not time-triggered.** Frames are stored only when the screen actually changes, plus a heartbeat every 60s as proof-of-life. An idle console costs almost nothing; a boot sequence keeps every distinct state. Pixel-identical frames are detected by hashing the PNG bytes, which skips image decoding entirely in the common idle case. Defaults: 1s sampling, 120 minutes retention, 3000 frames max, pruned oldest-first.
+**Storage is change-triggered, not time-triggered.** Frames are stored only when the screen actually changes, plus a heartbeat every 60s as proof-of-life. An idle console costs almost nothing; a boot sequence keeps every distinct state. Pixel-identical frames are detected by hashing the PNG bytes, which skips image decoding entirely in the common idle case. Defaults: 1s sampling, 240 minutes retention (sized so a long OS install fits — a 3-hour Windows install overflowed the earlier 120-minute default and lost its early history), 3000 frames max, pruned oldest-first.
 
 **Change-threshold calibration (measured, don't guess).** On a 1600×900 console a single character — a blinking cursor — moves ~0.0003 of the frame, while a whole new line of text moves 0.001–0.0026. The default threshold is therefore **0.0005**, which sits between the two: cursor blink is ignored, every new line of output is captured. Verified: 4/4 distinct screens recorded, 0 frames from 6 cursor toggles. An earlier 0.002 threshold looked conservative and silently discarded three quarters of real console activity — if you tune this, measure rather than assume, and bias low.
 
@@ -137,22 +137,49 @@ The API backstop **debounces**: a freshly relaunched console takes a few seconds
 
 The recorder classifies the two and responds accordingly: a sleeping console gets a bare `Shift` (types nothing, activates nothing) and is logged as a wake; a dropped tunnel goes down the recovery path. `vkvm_record_status` reports `wakes` separately from `recoveries`.
 
+> The wake path was dormant for a while: the `wakeConsole` hook was implemented and called, but never actually passed to the recorder, so a console asleep from user inactivity was simply left green with `wakes` stuck at 0. A missing *optional* hook cannot fail to compile and does not throw, so the hook set is now built in one place and asserted by a test.
+
 Prevention still matters more than cure: the console that reached "User Inactivity" was the one with `antiBlankMode: 'none'`, while a console running with the default mouse nudge went ~7 hours without ever sleeping.
 
 Four conditions trigger recovery: the tab closing, a death dialog / API-confirmed dead session, a **persistent "No Signal" state**, and **10 consecutive capture failures** — a page can break without closing and without showing any dialog (renderer crash, hung tab), and without that third trigger recording would stall silently for the rest of the night.
 
 Retries use escalating backoff (30s → 5 min cap) and continue indefinitely, so a long outage recovers on its own; the login circuit breaker separately protects the Cisco account. Recovery deliberately skips the launcher's auto-record so it cannot clobber the recorder driving it.
 
+**When relaunching cannot help: the born-dead console.** A relaunch that *succeeds* and then dies seconds later is a different failure from a relaunch that fails, and it needs a different remedy. Intersight's tunneled-vKVM bug makes every fresh session born dead, and the console **mounts looking healthy** before the death dialog appears — so the launcher's own born-dead check passes and the backoff ladder, which only arms when recovery throws, never engages. Observed live on `CHG-UCSX-2-2-5`: `console-dead → recovering → recovered` every ~9 seconds indefinitely, with `recoveryFailures` stuck at 0. Overnight that spins all night and records nothing, at the cost of a real API call and page load per cycle.
+
+The recorder now counts recoveries whose console died within 60s as **short-lived** and escalates instead of retrying blindly: after two in a row it runs the Tunneled vKVM disable/re-enable itself (the only thing that fixes this), logging a `vkvm-reset` event on the timeline. If the console *still* comes back dead after two such resets, recovery throws — which hands control to the normal backoff ladder rather than looping. A console that survives longer than the window clears both counters, so an ordinary nightly session timeout never triggers an escalation. `vkvm_record_status` exposes `shortLivedRecoveries` and `tunneledVkvmResets`.
+
 Everything is visible rather than silent: `vkvm_record_status` reports `state` (`recording` / `recovering` / `failed`), `consoleLive`, `recoveries`, `recoveryFailures`, `nextRecoveryAttemptAt` and `secondsSinceLastFrame`; `vkvm_timeline` interleaves `console-dead` / `recovering` / `recovered` events with the frames so a gap is explicit; and `vkvm_recent` prefixes its filmstrip with a loud **CONSOLE NOT LIVE** warning when the console isn't healthy, so stale frames can't be mistaken for the present. If a relaunch comes back born-dead, the failure detail names `reset_tunneled_vkvm` as the fix — that stays an agent decision, since it PATCHes server settings.
 
 **Keeping an idle console awake (anti-blank).** An idle console blanks into a screensaver, hiding the machine's state exactly when you are relying on the recording. Do not confuse this with the green *"No Signal"* screen above: a **blank/black** console means the *server's display* has gone to sleep and a nudge wakes it (verified — a black console turned out to be a sleeping Windows desktop); a **green "No Signal"** means the *tunnel* dropped, which no amount of input will fix and which triggers recovery instead. The recorder therefore nudges the console after `antiBlankSeconds` of idleness (default 240, under the usual 10-minute blank timeout; `0` disables).
 
 - **The first nudge is immediate**, not gated on the idle timer. A console is very often *already* blanked when you attach to it (verified live: a blanked Windows Server desktop presented as a plain black screen), so waiting out `antiBlankSeconds` would leave the agent staring at black for minutes before discovering there was a desktop there all along. The same applies right after a recovery, since the relaunched console may also be asleep.
-- **Then only when genuinely idle.** Idleness is measured by *any* pixel change — including sub-threshold ones like a ticking counter or spinner that aren't worth storing — so a console that is quietly doing something is never disturbed. (Using the storage threshold here was a bug: a log line advancing by one character looked idle.)
+- **Then only when genuinely idle.** Idleness is measured from real console *output* (above-threshold changes), and the nudge additionally requires the screen to be **at rest right now** — three consecutive pixel-identical samples. Those two conditions together are what separate a console that is *working* from one that merely has a clock on it.
+
+  This rule has been wrong in both directions, so it is worth stating why it is what it is. Measuring idleness by the storage threshold alone was the first bug: a log line advancing by one character looked idle. Measuring it by *any* pixel change — the obvious fix — was the second, and worse: a Windows taskbar clock repaints once a minute forever, so a booted desktop never accrued 240s of stillness and **anti-blank silently never ran on it** (measured: 0 nudges in 11 minutes on a Windows console, while a static UEFI console on the same browser nudged on schedule). A console blanks on *input* idle; it does not care what repaints itself. The still-sample requirement preserves the original intent — never inject input into a busy console — because a spinner or progress bar repaints on essentially every sample and never accumulates a still run, whereas a clock sits still for 59 samples out of 60.
 - **`antiBlankMode: 'mouse'` (default)** sends a 1px pointer move: it cannot type, cannot click, and bootloaders ignore pointer motion. **`'key'`** additionally taps Shift, which wakes a blanked Linux *text* console more reliably (tty blanking resets on keyboard input) — but pressing Shift during early boot drops some distros into the GRUB menu and can stall an unattended install, so it is opt-in. **`'none'`** disables input entirely.
-- **It never collides with the agent.** Deliberate input (`browser_send_keys`, `browser_mouse`, `vkvm_press_until`) runs under a marker; the nudge stands down while any interaction is in flight — including for the whole duration of a `press_until` loop — and for 60s afterwards, since real input has already reset the blank timer. `vkvm_record_status` reports `antiBlank.nudgesSent` and `lastNudgeAt`.
+- **It never collides with the agent — per console.** Deliberate input (`browser_send_keys`, `browser_mouse`, `vkvm_press_until`) runs under a marker; the nudge stands down while an interaction is in flight against *that* console — including for the whole duration of a `press_until` loop — and for 60s afterwards, since real input has already reset that console's blank timer. `vkvm_record_status` reports `antiBlank.nudgesSent` and `lastNudgeAt`.
+
+  The scoping is load-bearing. This bookkeeping was originally two scalars on the service, which is correct with one console and wrong with several: input on server A declined the due nudge on server B, and because a declined attempt still resets the idle clock, B's next nudge was pushed out another full window. Demonstrated live — a mouse move on C240 at 21:31:58 caused 2-2-5's 21:32:22 nudge to be declined (`nudgesSent` unchanged, `lastNudgeAt` advanced) — an agent touching one console every few minutes could keep every *other* console's anti-blank permanently deferred. It is now tracked per server (`AgentInputTracker`).
 
 Note: the capture loop deliberately does **not** call `bringToFront()`. Stealing focus every second would make the operator's desktop unusable; Chromium is launched with background throttling disabled so background tabs keep painting.
+
+### Recording several consoles at once
+
+Recorders are independent and run concurrently in one browser. Measured over a two-console run (a Windows desktop and a UEFI shell, 1s sampling each):
+
+| | C240 (Windows) | 2-2-5 (UEFI shell) |
+|---|---|---|
+| Frames / disk over ~11 min | 14 / 2.5 MB | 21 / 1.5 MB |
+| Capture errors | 0 | 0 |
+| Heartbeat intervals | 60.4–60.5s | 60.4–60.5s |
+
+Interference is negligible — about 0.45s of drift per minute, i.e. ~7ms of added capture cost per 1s tick — and frames never cross over between recorders. That works *because* of the no-`bringToFront()` rule above: two 1 Hz samplers that each activated their tab would fight over focus every second.
+
+Two things are worth knowing when running more than one:
+
+- **Anti-blank is per console** (see above). Getting this wrong is the main way parallel recording degrades quietly.
+- **One live tunneled session per server.** `launch_vkvm_session` reuses an existing live session rather than launching a duplicate, because a second session for the same server is born dead — that is a *per-server* limit, not a global one, so recording many servers at once is fine.
 
 ### The "KVM session has ended" bug and `reset_tunneled_vkvm`
 

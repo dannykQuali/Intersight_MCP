@@ -36,6 +36,7 @@ For **unattended/overnight runs**, the server can log itself in via Cisco ID (us
 ```bash
 npm install
 npm run build
+npm test        # optional — see docs/TESTING.md
 ```
 
 ### 2. Configure LLM Client

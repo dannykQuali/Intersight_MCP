@@ -5341,6 +5341,10 @@ export class IntersightMCPServer {
   private getBrowserService(): BrowserService {
     if (!this.browserService) {
       this.browserService = new BrowserService(loadConfig().baseUrl);
+      // Lets a recorder escalate to the Tunneled vKVM disable/re-enable when a
+      // relaunched console keeps coming back dead (an Intersight bug that no
+      // amount of relaunching fixes).
+      this.browserService.setTunneledVkvmResetter((moid) => this.resetTunneledVkvm(moid));
     }
     return this.browserService;
   }

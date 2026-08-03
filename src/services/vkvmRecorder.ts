@@ -40,8 +40,66 @@ export interface RecordedFrame {
 /** A notable non-frame occurrence (console death, recovery), for the timeline. */
 export interface RecorderEvent {
   at: number;
-  kind: 'console-dead' | 'recovering' | 'recovered' | 'recovery-failed' | 'stopped';
+  kind: 'console-dead' | 'recovering' | 'recovered' | 'recovery-failed' | 'vkvm-reset' | 'stopped';
   detail?: string;
+}
+
+/** Everything the anti-blank decision depends on. See {@link shouldNudge}. */
+export interface NudgeDecision {
+  now: number;
+  antiBlankSeconds: number;
+  mode: 'mouse' | 'key' | 'none';
+  state: string;
+  /** Attached to a console we have not nudged yet - it may already be blanked. */
+  needsInitialNudge: boolean;
+  /** Last change big enough to store: real console output. */
+  lastChangeAt: number;
+  lastNudgeAt: number;
+  startedAt: number;
+  /** Consecutive pixel-identical samples, i.e. how long the screen has sat still. */
+  stillSamples: number;
+}
+
+/**
+ * Consecutive identical samples that mean "the screen is at rest right now".
+ *
+ * This is what separates a console that is WORKING from one that merely has a
+ * clock on it. A spinner or progress bar repaints on essentially every sample
+ * and never accumulates a still run; a taskbar clock repaints once a minute and
+ * sits still for the other 59 samples.
+ */
+export const STILL_SAMPLES_BEFORE_NUDGE = 3;
+
+/**
+ * Decide whether an idle console is due for an anti-blank nudge.
+ *
+ * Idleness is measured from real console OUTPUT (above-threshold changes), not
+ * from any pixel movement at all. Keying off every sub-threshold repaint looked
+ * safer but silently disabled anti-blank on every booted OS: a Windows taskbar
+ * clock ticks forever, so the console never accrued the 240s of stillness the
+ * nudge required and blanked anyway (verified live - 0 nudges in 11 minutes on
+ * a Windows console, while a static UEFI console nudged on schedule). A console
+ * blanks on INPUT idle and does not care what repaints itself.
+ *
+ * The original intent - never inject input into a console that is busy - is
+ * preserved by `stillSamples`, which requires the screen to be quiet at the
+ * moment we act rather than for the whole window.
+ */
+export function shouldNudge(d: NudgeDecision): boolean {
+  if (d.mode === 'none' || d.antiBlankSeconds <= 0 || d.state !== 'recording') {
+    return false;
+  }
+  // The very first nudge is not gated on idleness: the console may already be
+  // blanked when we attach, and the agent should not have to wait out the whole
+  // idle timeout to discover what is on screen.
+  if (d.needsInitialNudge) {
+    return true;
+  }
+  const idleSince = Math.max(d.lastChangeAt, d.lastNudgeAt, d.startedAt);
+  if (d.now - idleSince < d.antiBlankSeconds * 1000) {
+    return false;
+  }
+  return d.stillSamples >= STILL_SAMPLES_BEFORE_NUDGE;
 }
 
 /**
@@ -71,6 +129,14 @@ export interface RecorderHooks {
   wakeConsole?: () => Promise<boolean>;
   /** Re-establish the console (re-login + relaunch) and return the new page. */
   recover?: () => Promise<Page | null>;
+  /**
+   * Disable and re-enable Tunneled vKVM on the server (~60s).
+   *
+   * Escalation for the Intersight bug where every freshly launched console is
+   * born dead. Relaunching cannot fix that state, so without this the recorder
+   * just relaunches forever; this is the only thing that does fix it.
+   */
+  resetTunneledVkvm?: () => Promise<void>;
   /**
    * Send a harmless input to stop the console blanking. Returns false if the
    * owner declined (e.g. the agent is interacting right now, or has just sent
@@ -131,6 +197,11 @@ export interface RecorderOptions {
    *  - 'none'   never send input.
    */
   antiBlankMode?: 'mouse' | 'key' | 'none';
+  /**
+   * A recovered console that dies again within this long was never really
+   * alive. Default 60000ms. Exposed mainly so tests can compress the timings.
+   */
+  shortLivedRecoveryMs?: number;
 }
 
 /**
@@ -208,14 +279,37 @@ export class VkvmRecorder {
   private wakes = 0;
   /** ~4 checks x 10s: long enough for a genuine self-reconnect, short enough to matter. */
   private static readonly DISCONNECTED_CHECKS_BEFORE_RECOVERY = 4;
+  /**
+   * When a recovered console was last handed back to us. A console that dies
+   * again within shortLivedRecoveryMs of this was born dead, which relaunching
+   * cannot fix - see triggerRecovery().
+   */
+  private lastRecoveredAt = 0;
+  /** Consecutive recoveries whose console died almost immediately. */
+  private shortLivedRecoveries = 0;
+  /** Tunneled vKVM disable/re-enable cycles run for the current bad streak. */
+  private tunneledResets = 0;
+  /** Two quick deaths is a pattern, not a coincidence; escalate then. */
+  private static readonly SHORT_LIVED_BEFORE_RESET = 2;
+  /** Resetting twice without it sticking means the problem is something else. */
+  private static readonly MAX_TUNNELED_RESETS = 2;
+  /** Surviving this many short-lived windows (10 min by default) means healthy. */
+  private static readonly HEALTHY_RECOVERY_FACTOR = 10;
+  /**
+   * Ceiling on the Tunneled vKVM reset, which is a multi-minute REST + workflow
+   * round trip running inside the recovery critical section. Without it a hung
+   * request would leave the recorder stuck in `recovering` - not capturing, not
+   * retrying - for the rest of the night.
+   */
+  private static readonly TUNNELED_RESET_TIMEOUT_MS = 300000;
   private lastChangeAt = 0;
   /**
-   * Last time ANY pixel differed - including sub-threshold changes that are not
-   * worth storing (a ticking counter, a spinner). Used for "is the console
-   * idle?" so a screen that is quietly doing something is never nudged, while
-   * frame STORAGE stays threshold-gated.
+   * Consecutive pixel-identical samples: how long the screen has sat perfectly
+   * still. Used to tell a console that is WORKING (spinner, progress bar - never
+   * accumulates a still run) from one that merely has a clock on it (still for
+   * 59 samples out of 60). Frame STORAGE stays threshold-gated as before.
    */
-  private lastPixelChangeAt = 0;
+  private stillSamples = 0;
   private lastNudgeAt = 0;
   private nudges = 0;
   private nudging = false;
@@ -243,6 +337,7 @@ export class VkvmRecorder {
       apiCheckEveryTicks: Math.max(5, opts?.apiCheckEveryTicks ?? 60),
       antiBlankSeconds: opts?.antiBlankSeconds ?? 240,
       antiBlankMode: opts?.antiBlankMode ?? 'mouse',
+      shortLivedRecoveryMs: Math.max(1, opts?.shortLivedRecoveryMs ?? 60000),
     };
   }
 
@@ -308,6 +403,7 @@ export class VkvmRecorder {
     this.page = page;
     this.lastHash = null;
     this.lastPng = null;
+    this.stillSamples = 0;
     // A freshly relaunched console may itself be blanked - wake it immediately.
     this.needsInitialNudge = true;
     // Give the new session time to register as Active before the API backstop
@@ -339,6 +435,24 @@ export class VkvmRecorder {
     }
 
     this.recovering = true;
+    // A console that dies again seconds after being re-established was never
+    // really alive: Intersight's tunneled-vKVM bug makes every fresh session
+    // born dead, and it mounts looking healthy before the death dialog appears,
+    // so the relaunch "succeeds" every time. Counting these separately from
+    // failed relaunches is what stops the ~9-second relaunch loop that ran all
+    // night on CHG-UCSX-2-2-5.
+    const sinceRecovered = this.lastRecoveredAt > 0 ? Date.now() - this.lastRecoveredAt : Infinity;
+    if (sinceRecovered < this.opts.shortLivedRecoveryMs) {
+      this.shortLivedRecoveries++;
+    } else if (sinceRecovered >= this.opts.shortLivedRecoveryMs * VkvmRecorder.HEALTHY_RECOVERY_FACTOR) {
+      // The console lived a good long while, so whatever was wrong has cleared:
+      // an ordinary overnight session timeout must never look like the bug.
+      this.shortLivedRecoveries = 0;
+      this.tunneledResets = 0;
+    }
+    // In between the two, counters are left alone: a console that lasted a
+    // couple of minutes is not proof of health, and clearing on it would let a
+    // genuinely broken server churn through fresh reset cycles all night.
     const wasState = this.state;
     this.state = 'recovering';
     if (wasState !== 'recovering') {
@@ -346,6 +460,9 @@ export class VkvmRecorder {
     }
     this.addEvent('recovering', `attempt ${this.recoveryFailures + 1}`);
     try {
+      if (this.shortLivedRecoveries >= VkvmRecorder.SHORT_LIVED_BEFORE_RESET) {
+        await this.resetTunneledVkvm();
+      }
       const page = await this.hooks.recover();
       if (!page) {
         throw new Error('recovery did not produce a console page');
@@ -354,6 +471,7 @@ export class VkvmRecorder {
       this.recoveryFailures = 0;
       this.nextRecoveryAt = 0;
       this.recoveries++;
+      this.lastRecoveredAt = Date.now();
       this.state = 'recording';
       this.addEvent('recovered', 'console re-established; recording resumed');
     } catch (error) {
@@ -370,6 +488,54 @@ export class VkvmRecorder {
     } finally {
       this.recovering = false;
     }
+  }
+
+  /**
+   * Every relaunch has produced a console that died immediately. Relaunching
+   * again cannot help - the fix is to disable and re-enable Tunneled vKVM on
+   * the server. Throws once that has been tried and the console STILL comes
+   * back dead, which hands control to the caller's backoff ladder rather than
+   * letting the loop run all night.
+   */
+  private async resetTunneledVkvm(): Promise<void> {
+    const windowSec = Math.round(this.opts.shortLivedRecoveryMs / 1000);
+    if (!this.hooks.resetTunneledVkvm) {
+      throw new Error(
+        `console died within ${windowSec}s of each of the last ${this.shortLivedRecoveries} relaunches ` +
+          `and no Tunneled vKVM reset is available - run reset_tunneled_vkvm for this server`
+      );
+    }
+    if (this.tunneledResets >= VkvmRecorder.MAX_TUNNELED_RESETS) {
+      throw new Error(
+        `console still dies within ${windowSec}s of every relaunch after ${this.tunneledResets} ` +
+          `Tunneled vKVM reset(s) - the server needs attention`
+      );
+    }
+    this.tunneledResets++;
+    this.addEvent(
+      'vkvm-reset',
+      `console died within ${windowSec}s of ${this.shortLivedRecoveries} relaunches in a row; ` +
+        `disabling and re-enabling Tunneled vKVM (reset ${this.tunneledResets}/${VkvmRecorder.MAX_TUNNELED_RESETS})`
+    );
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.hooks.resetTunneledVkvm(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('Tunneled vKVM reset timed out')),
+            VkvmRecorder.TUNNELED_RESET_TIMEOUT_MS
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+    // Give the reset a fair chance: judge the next console on its own merits.
+    this.shortLivedRecoveries = 0;
   }
 
   /** Capture one sample; store it only if the console changed (or heartbeat is due). */
@@ -454,13 +620,14 @@ export class VkvmRecorder {
         // Pixel-identical: no decode needed at all. NOTE: this is the idle path,
         // which is exactly when an anti-blank nudge is due - so it must fall
         // through to maybeNudge() rather than returning early.
+        this.stillSamples++;
         if (heartbeatDue) {
           this.store(buf, now, 0, 'heartbeat');
         }
       } else {
-        // Any pixel difference at all means the console is doing something,
-        // even if it is too small to be worth storing.
-        this.lastPixelChangeAt = now;
+        // Something repainted. That may be real output or just a clock digit;
+        // the still-run is what tells those apart over time.
+        this.stillSamples = 0;
         const png = this.decode(buf);
         if (png) {
           const ratio = this.sampledDiff(this.lastPng, png);
@@ -504,23 +671,22 @@ export class VkvmRecorder {
    * agent's own interaction). The owner has final say via the nudge hook.
    */
   private async maybeNudge(now: number): Promise<void> {
-    if (
-      this.nudging ||
-      !this.hooks.nudge ||
-      this.opts.antiBlankMode === 'none' ||
-      this.opts.antiBlankSeconds <= 0 ||
-      this.state !== 'recording'
-    ) {
+    if (this.nudging || !this.hooks.nudge) {
       return;
     }
-    // The very first nudge is not gated on idleness: the console may already be
-    // blanked when we attach, and the agent should not have to wait out the
-    // whole idle timeout to discover what is on screen.
-    if (!this.needsInitialNudge) {
-      const idleSince = Math.max(this.lastPixelChangeAt, this.lastChangeAt, this.lastNudgeAt, this.startedAt);
-      if (now - idleSince < this.opts.antiBlankSeconds * 1000) {
-        return;
-      }
+    const due = shouldNudge({
+      now,
+      antiBlankSeconds: this.opts.antiBlankSeconds,
+      mode: this.opts.antiBlankMode,
+      state: this.state,
+      needsInitialNudge: this.needsInitialNudge,
+      lastChangeAt: this.lastChangeAt,
+      lastNudgeAt: this.lastNudgeAt,
+      startedAt: this.startedAt,
+      stillSamples: this.stillSamples,
+    });
+    if (!due) {
+      return;
     }
     this.nudging = true;
     // Cleared on attempt, not on success: if the owner declines (the agent is
@@ -731,6 +897,9 @@ export class VkvmRecorder {
       consoleLive: this.state === 'recording',
       recoveries: this.recoveries,
       recoveryFailures: this.recoveryFailures,
+      /** Relaunches whose console died immediately - the Intersight born-dead bug. */
+      shortLivedRecoveries: this.shortLivedRecoveries,
+      tunneledVkvmResets: this.tunneledResets,
       wakes: this.wakes,
       antiBlank: {
         mode: this.opts.antiBlankMode,

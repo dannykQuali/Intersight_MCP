@@ -27,8 +27,9 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright-core';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import { loadSsoConfig, SsoConfig } from '../utils/config.js';
-import { VkvmRecorder, RecordedFrame, RecorderOptions } from './vkvmRecorder.js';
+import { VkvmRecorder, RecordedFrame, RecorderHooks, RecorderOptions } from './vkvmRecorder.js';
 import { FrameOcr } from './frameOcr.js';
+import { AgentInputTracker } from './agentInputTracker.js';
 import { generateTotp, parseTotpConfig, secondsRemainingInWindow, TotpParams } from '../utils/totp.js';
 
 export interface SessionApiResult {
@@ -90,9 +91,15 @@ export class BrowserService {
   // relaunch the same console after a session timeout without the caller.
   private kvmServers = new Map<string, { moid: string; objectType: string; name?: string }>();
   // Deliberate input from the agent (keys/mouse). The background anti-blank
-  // nudge must never overlap or race with it.
-  private agentInputInFlight = 0;
-  private lastAgentInputAt = 0;
+  // nudge must never overlap or race with it - but only on the console the
+  // agent is actually using, which is why this is tracked per server.
+  private agentInput = new AgentInputTracker();
+  /**
+   * Disable/re-enable Tunneled vKVM on a server. Injected by the MCP server,
+   * which owns the API client; the recorder escalates to it when a relaunched
+   * console keeps coming back dead.
+   */
+  private tunneledVkvmResetter: ((serverMoid: string) => Promise<unknown>) | null = null;
 
   constructor(intersightBaseUrl: string) {
     // baseUrl is e.g. https://intersight.com/api/v1 -> keep the origin only
@@ -1182,7 +1189,10 @@ export class BrowserService {
    * A mouse move is NOT enough here - verified live.
    */
   private async wakeConsole(serverMoid: string): Promise<boolean> {
-    if (this.agentInputInFlight > 0) {
+    // Unlike the anti-blank nudge, a wake is still WANTED shortly after agent
+    // input: if the console is asleep, that input evidently did not wake it.
+    // Only an in-flight interaction is a reason to hold off.
+    if (this.agentInput.isInputInFlight(serverMoid)) {
       return false;
     }
     const page = this.kvmPages.get(serverMoid);
@@ -1192,7 +1202,7 @@ export class BrowserService {
     try {
       await this.focusConsole(page);
       await page.keyboard.press('Shift');
-      this.lastAgentInputAt = Date.now();
+      this.agentInput.markInput(serverMoid);
       return true;
     } catch {
       return false;
@@ -1823,7 +1833,7 @@ export class BrowserService {
 
     // Held for the whole loop so the anti-blank nudge cannot inject a stray
     // event between key presses.
-    const r = await this.withAgentInput(() =>
+    const r = await this.withAgentInput(page, () =>
       this.sampleLoop(page, {
         mode: stopOn,
         timeoutMs: opts.timeoutMs ?? 60000,
@@ -1915,8 +1925,8 @@ export class BrowserService {
    * "Control+Alt+Delete").
    */
   async sendKeys(opts: { serverMoid?: string; text?: string; keys?: string[] }): Promise<any> {
-    return this.withAgentInput(async () => {
-      const page = this.resolvePage(opts.serverMoid);
+    const page = this.resolvePage(opts.serverMoid);
+    return this.withAgentInput(page, async () => {
       await page.bringToFront().catch(() => {});
       await this.focusConsole(page);
       if (opts.text) {
@@ -1937,8 +1947,8 @@ export class BrowserService {
    * coordinates.
    */
   async mouse(opts: MouseInput & { serverMoid?: string }): Promise<any> {
-    return this.withAgentInput(async () => {
-      const page = this.resolvePage(opts.serverMoid);
+    const page = this.resolvePage(opts.serverMoid);
+    return this.withAgentInput(page, async () => {
       await page.bringToFront().catch(() => {});
       let x = opts.x;
       let y = opts.y;
@@ -2057,14 +2067,19 @@ export class BrowserService {
    * background anti-blank nudge stays out of its way, and so real input counts
    * as activity (it already resets the console's blank timer).
    */
-  private async withAgentInput<T>(fn: () => Promise<T>): Promise<T> {
-    this.agentInputInFlight++;
-    try {
-      return await fn();
-    } finally {
-      this.agentInputInFlight--;
-      this.lastAgentInputAt = Date.now();
+  private async withAgentInput<T>(target: Page | string | null, fn: () => Promise<T>): Promise<T> {
+    const moid = typeof target === 'string' ? target : target ? this.moidForPage(target) : null;
+    return this.agentInput.run(moid, fn);
+  }
+
+  /** Which console a page belongs to, or null if it is not a vKVM tab. */
+  private moidForPage(page: Page): string | null {
+    for (const [moid, p] of this.kvmPages) {
+      if (p === page) {
+        return moid;
+      }
     }
+    return null;
   }
 
   /**
@@ -2079,10 +2094,9 @@ export class BrowserService {
    * GRUB menu during early boot — opt in via antiBlankMode: 'key').
    */
   private async nudgeConsole(serverMoid: string): Promise<boolean> {
-    if (this.agentInputInFlight > 0) {
-      return false;
-    }
-    if (Date.now() - this.lastAgentInputAt < 60000) {
+    // Only THIS console's activity matters. Judging by any console's activity
+    // let one busy server hold off every other server's anti-blank.
+    if (this.agentInput.isBusy(serverMoid)) {
       return false; // the agent's own input already counted as activity
     }
     const page = this.kvmPages.get(serverMoid);
@@ -2097,8 +2111,12 @@ export class BrowserService {
     try {
       // Small move well inside the console area (clear of the vKVM toolbar),
       // alternating so consecutive nudges are always a real movement delta.
-      const drift = this.nudgeToggle ? 3 : -3;
-      this.nudgeToggle = !this.nudgeToggle;
+      // Tracked PER CONSOLE: a single shared toggle let two consoles nudging on
+      // the same cadence flip it for each other, so one of them could be sent
+      // the same coordinates twice running - a no-op move that wakes nothing.
+      const toggled = !this.nudgeToggles.get(serverMoid);
+      this.nudgeToggles.set(serverMoid, toggled);
+      const drift = toggled ? 3 : -3;
       await page.mouse.move(820 + drift, 500 + drift);
       if (mode === 'key') {
         // Modifier only: produces no character and submits nothing.
@@ -2109,7 +2127,53 @@ export class BrowserService {
       return false;
     }
   }
-  private nudgeToggle = false;
+  /** serverMoid -> which way the last anti-blank nudge drifted the pointer. */
+  private nudgeToggles = new Map<string, boolean>();
+
+  /**
+   * Supply the Tunneled vKVM disable/re-enable routine (owned by the MCP
+   * server, which has the API client). Without it the recorder can still
+   * recover, but cannot fix a server whose every console is born dead.
+   */
+  setTunneledVkvmResetter(reset: (serverMoid: string) => Promise<unknown>): void {
+    this.tunneledVkvmResetter = reset;
+  }
+
+  private async resetTunneledVkvmFor(serverMoid: string): Promise<void> {
+    if (!this.tunneledVkvmResetter) {
+      throw new Error('No Tunneled vKVM reset is wired up');
+    }
+    await this.tunneledVkvmResetter(serverMoid);
+  }
+
+  /**
+   * Everything a recorder needs from the browser to keep one console healthy.
+   *
+   * Built in one place deliberately: these were assembled inline at the call
+   * site and `wakeConsole` was simply left out, which silently disabled the
+   * "User Inactivity - press a key to wake" remedy. Nothing failed loudly; the
+   * recorder just kept recording a green screen with `wakes` stuck at 0.
+   */
+  private recorderHooks(serverMoid: string): RecorderHooks {
+    return {
+      // A dead console is a perfectly static image, so change detection alone
+      // would report a calm machine forever - check the page explicitly.
+      isConsoleDead: (p) => this.isConsoleEnded(p),
+      isConsoleDisconnected: (p) => this.isConsoleDisconnected(p),
+      isSessionDeadViaApi: () => this.isSessionDeadViaApi(serverMoid),
+      // A console asleep from user inactivity needs a KEY, not a relaunch.
+      wakeConsole: () => this.wakeConsole(serverMoid),
+      // Session timeouts are expected on long runs: re-login and relaunch the
+      // console, then hand the new page back so recording continues.
+      recover: () => this.recoverConsole(serverMoid),
+      // Keep an idle console awake, but never while the agent is interacting.
+      nudge: () => this.nudgeConsole(serverMoid),
+      // Escalation when relaunching alone cannot revive the console.
+      ...(this.tunneledVkvmResetter
+        ? { resetTunneledVkvm: () => this.resetTunneledVkvmFor(serverMoid) }
+        : {}),
+    };
+  }
 
   /** Start recording a server's console. Idempotent. */
   startRecording(serverMoid: string, opts?: RecorderOptions): any {
@@ -2118,18 +2182,12 @@ export class BrowserService {
     if (existing && existing.isRunning()) {
       return { recording: true, alreadyRunning: true, serverMoid, ...existing.status() };
     }
-    const recorder = new VkvmRecorder(page, path.join(this.recordingDir, serverMoid), opts, {
-      // A dead console is a perfectly static image, so change detection alone
-      // would report a calm machine forever - check the page explicitly.
-      isConsoleDead: (p) => this.isConsoleEnded(p),
-      isConsoleDisconnected: (p) => this.isConsoleDisconnected(p),
-      isSessionDeadViaApi: () => this.isSessionDeadViaApi(serverMoid),
-      // Session timeouts are expected on long runs: re-login and relaunch the
-      // console, then hand the new page back so recording continues.
-      recover: () => this.recoverConsole(serverMoid),
-      // Keep an idle console awake, but never while the agent is interacting.
-      nudge: () => this.nudgeConsole(serverMoid),
-    });
+    const recorder = new VkvmRecorder(
+      page,
+      path.join(this.recordingDir, serverMoid),
+      opts,
+      this.recorderHooks(serverMoid)
+    );
     recorder.start();
     this.recorders.set(serverMoid, recorder);
     return { recording: true, serverMoid, ...recorder.status() };

@@ -20,6 +20,34 @@ export function solidPng(level: number, width = 16, height = 16): Buffer {
   return PNG.sync.write(png);
 }
 
+/**
+ * A frame with a bright mark whose POSITION depends on the seed — like real
+ * console output, each update lands somewhere new.
+ *
+ * Fixtures that "changed" by cycling whole-frame colours or toggling two frames
+ * stopped working the moment change classification got smarter: a regular
+ * whole-frame cycle is RHYTHMIC and a two-frame toggle is OSCILLATING, both
+ * correctly ignored. New content in fresh locations is what genuine activity
+ * looks like, so it is what activity fixtures must produce.
+ */
+export function movingMarkFrame(seed: number, width = 200, height = 200): Buffer {
+  const png = new PNG({ width, height });
+  for (let i = 0; i < png.data.length; i += 4) {
+    png.data[i + 3] = 255;
+  }
+  const x = (seed * 53) % (width - 10);
+  const y = (seed * 37) % (height - 10);
+  for (let dy = 0; dy < 10; dy++) {
+    for (let dx = 0; dx < 10; dx++) {
+      const i = (width * (y + dy) + (x + dx)) << 2;
+      png.data[i] = 255;
+      png.data[i + 1] = 255;
+      png.data[i + 2] = 255;
+    }
+  }
+  return PNG.sync.write(png);
+}
+
 export class FakeConsolePage {
   private closed = false;
   /** Number of screenshots taken - lets a test see the capture loop running. */

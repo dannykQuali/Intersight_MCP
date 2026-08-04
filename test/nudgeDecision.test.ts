@@ -23,7 +23,7 @@ function idleConsole(overrides: Partial<NudgeDecision> = {}): NudgeDecision {
     mode: 'mouse',
     state: 'recording',
     needsInitialNudge: false,
-    lastChangeAt: NOW - 600_000,
+    lastNoveltyAt: NOW - 600_000,
     lastNudgeAt: NOW - 600_000,
     startedAt: NOW - 600_000,
     stillSamples: 30,
@@ -46,8 +46,8 @@ describe('shouldNudge', () => {
   });
 
   it('does not nudge while real console output is flowing', () => {
-    // An above-threshold change moments ago: boot messages, an installer step.
-    assert.equal(shouldNudge(idleConsole({ lastChangeAt: NOW - 1000 })), false);
+    // Novel content moments ago: boot messages, an installer step.
+    assert.equal(shouldNudge(idleConsole({ lastNoveltyAt: NOW - 1000 })), false);
   });
 
   it('waits the full anti-blank window after the previous nudge', () => {
@@ -62,7 +62,7 @@ describe('shouldNudge', () => {
     // A console is very often already blanked when we attach to it.
     const fresh = idleConsole({
       needsInitialNudge: true,
-      lastChangeAt: NOW,
+      lastNoveltyAt: NOW,
       startedAt: NOW,
       stillSamples: 0,
     });

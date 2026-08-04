@@ -25,6 +25,8 @@ import fs from 'fs';
 import path from 'path';
 import { PNG } from 'pngjs';
 import type { Page } from 'playwright-core';
+import { writeRecorderState } from './recorderState.js';
+import { TileTracker } from './tileNovelty.js';
 
 export interface RecordedFrame {
   seq: number;
@@ -52,34 +54,85 @@ export interface NudgeDecision {
   state: string;
   /** Attached to a console we have not nudged yet - it may already be blanked. */
   needsInitialNudge: boolean;
-  /** Last change big enough to store: real console output. */
-  lastChangeAt: number;
+  /** Last NOVEL change: new content appearing, as classified by the tile tracker. */
+  lastNoveltyAt: number;
   lastNudgeAt: number;
   startedAt: number;
-  /** Consecutive pixel-identical samples, i.e. how long the screen has sat still. */
+  /**
+   * Consecutive samples with the screen at rest — pixel-identical, or moving
+   * only by a blink (an oscillating tile returning to a known state).
+   */
   stillSamples: number;
 }
 
 /**
- * Consecutive identical samples that mean "the screen is at rest right now".
+ * Consecutive at-rest samples that mean "the screen is quiet right now".
  *
  * This is what separates a console that is WORKING from one that merely has a
- * clock on it. A spinner or progress bar repaints on essentially every sample
- * and never accumulates a still run; a taskbar clock repaints once a minute and
- * sits still for the other 59 samples.
+ * clock or a cursor on it. A spinner or progress bar produces novel or rhythmic
+ * tiles on essentially every sample and never accumulates a still run; a clock
+ * sits still for 59 samples out of 60, and a blinking cursor counts as rest
+ * outright (its tile only ever returns to a known state).
  */
 export const STILL_SAMPLES_BEFORE_NUDGE = 3;
+
+/** Console text transcript, one JSON line per text change, beside the frames. */
+export const OCR_TEXT_FILENAME = 'text.jsonl';
+
+/**
+ * Frames allowed to queue for recognition before the backlog is trimmed.
+ *
+ * Recognition (~1s) is about as slow as sampling (1s), so sustained activity
+ * would grow an unbounded queue over a multi-hour install. Trimming the OLDEST
+ * keeps the transcript current — which is what a stall check needs — and
+ * anything dropped is counted rather than quietly skipped.
+ */
+const MAX_OCR_QUEUE = 300;
+
+/** Transcript lines kept before the file is compacted to its newest half. */
+const MAX_TRANSCRIPT_LINES = 5000;
+
+/**
+ * Alphanumeric characters a frame must yield before its text is believed.
+ *
+ * OCR engines do not reliably return "nothing" for a screen with no text — they
+ * can hallucinate. Measured on real frames of a console page still loading
+ * (just an animated spinner, no text at all): every frame produced a DIFFERENT
+ * single character ("<", "a", "A)", "(", "~", "C"), so every frame looked like
+ * a text change. The frames are lossless PNG, so it was not compression noise —
+ * the engine read the ANTIALIASED EDGES of vector graphics as glyph strokes.
+ * That inverts the signal exactly where it matters most: a frozen textless
+ * screen is a classic wedge, and "the text keeps changing" is the opposite of
+ * the truth. The current engine benchmarks clean on that same frame, but this
+ * floor stays as engine-independent insurance.
+ *
+ * Real console text yields dozens of characters, so a floor separates the two
+ * cleanly. Below it, the frame is treated as having no readable text at all.
+ */
+const MIN_MEANINGFUL_TEXT_CHARS = 5;
+
+/**
+ * The text of a frame, or '' when there is nothing legible on it.
+ * Exported for testing the rule directly.
+ */
+export function meaningfulText(text: string | null): string {
+  if (!text) {
+    return '';
+  }
+  const alnum = text.replace(/[^a-z0-9]/gi, '');
+  return alnum.length >= MIN_MEANINGFUL_TEXT_CHARS ? text.replace(/\s+/g, ' ').trim() : '';
+}
 
 /**
  * Decide whether an idle console is due for an anti-blank nudge.
  *
- * Idleness is measured from real console OUTPUT (above-threshold changes), not
- * from any pixel movement at all. Keying off every sub-threshold repaint looked
- * safer but silently disabled anti-blank on every booted OS: a Windows taskbar
- * clock ticks forever, so the console never accrued the 240s of stillness the
- * nudge required and blanked anyway (verified live - 0 nudges in 11 minutes on
- * a Windows console, while a static UEFI console nudged on schedule). A console
- * blanks on INPUT idle and does not care what repaints itself.
+ * Idleness is measured from NOVELTY - new content appearing, as classified by
+ * the tile tracker - not from pixel movement. This rule has been wrong twice:
+ * keying off stored changes missed slow output, and keying off any pixel
+ * movement silently disabled anti-blank on every booted OS (a taskbar clock
+ * ticks forever, so the console never looked idle - verified live, 0 nudges in
+ * 11 minutes on a Windows console). A console blanks on INPUT idle; a clock
+ * repainting itself is not input, and the tracker knows the difference.
  *
  * The original intent - never inject input into a console that is busy - is
  * preserved by `stillSamples`, which requires the screen to be quiet at the
@@ -95,7 +148,7 @@ export function shouldNudge(d: NudgeDecision): boolean {
   if (d.needsInitialNudge) {
     return true;
   }
-  const idleSince = Math.max(d.lastChangeAt, d.lastNudgeAt, d.startedAt);
+  const idleSince = Math.max(d.lastNoveltyAt, d.lastNudgeAt, d.startedAt);
   if (d.now - idleSince < d.antiBlankSeconds * 1000) {
     return false;
   }
@@ -127,6 +180,13 @@ export interface RecorderHooks {
    * does NOT fix that state; the screen asks for a keypress.
    */
   wakeConsole?: () => Promise<boolean>;
+  /**
+   * Recognise the text of a stored frame, or null if OCR is unavailable.
+   *
+   * Supplied by BrowserService so every recorder shares ONE OCR worker rather
+   * than each loading its own copy of the recognition models.
+   */
+  ocrFrame?: (framePath: string) => Promise<string | null>;
   /** Re-establish the console (re-login + relaunch) and return the new page. */
   recover?: () => Promise<Page | null>;
   /**
@@ -157,16 +217,6 @@ export interface RecorderOptions {
   retentionMinutes?: number;
   /** Hard cap on retained frames (protects disk). Default 3000. */
   maxFrames?: number;
-  /**
-   * Sampled-pixel fraction that counts as a real change. Default 0.0005.
-   *
-   * Calibrated against measurements on a 1600x900 console: a single character
-   * (e.g. a blinking cursor) moves ~0.0003 of the frame, while a whole new line
-   * of text moves 0.001-0.0026. A 0.0005 threshold therefore ignores cursor
-   * blink but captures every new line of output. Do NOT raise this to the
-   * "obviously safe" 1% - that silently discards real console activity.
-   */
-  threshold?: number;
   /** Store a frame at least this often even when nothing changes. Default 60s. */
   heartbeatSeconds?: number;
   /**
@@ -202,6 +252,21 @@ export interface RecorderOptions {
    * alive. Default 60000ms. Exposed mainly so tests can compress the timings.
    */
   shortLivedRecoveryMs?: number;
+  /**
+   * Recognise the text of every stored frame into a transcript beside them
+   * (default true when an OCR hook is available).
+   *
+   * Costs ~1s of CPU per stored frame — nothing on an idle console (one
+   * heartbeat a minute), real work during an install. Buys the only signal that
+   * separates a wedged machine from a slow one.
+   */
+  ocrText?: boolean;
+  /**
+   * Give up on a single frame's recognition after this long (default 30000ms).
+   * Recognition normally takes ~0.4-1.4s; the cap exists because the worker has
+   * been seen not to come back, and a stalled queue is worse than a lost frame.
+   */
+  ocrTimeoutMs?: number;
 }
 
 /**
@@ -252,6 +317,9 @@ export class VkvmRecorder {
   private static readonly CAPTURE_ERRORS_BEFORE_RECOVERY = 10;
   /** Highest seq the agent has actually been shown, for "what did I miss". */
   private lastViewedSeq = 0;
+  /** Frames dropped by the ring buffer, i.e. evidence that no longer exists. */
+  private framesEvicted = 0;
+  private evictionStartedAt = 0;
 
   // Self-healing state. An unattended overnight run WILL hit the Intersight
   // session timeout; when it does, the console dies and the recorder would
@@ -302,12 +370,17 @@ export class VkvmRecorder {
    * retrying - for the rest of the night.
    */
   private static readonly TUNNELED_RESET_TIMEOUT_MS = 300000;
-  private lastChangeAt = 0;
+  /** Last time NEW content appeared, as classified by the tile tracker. */
+  private lastNoveltyAt = 0;
+  /** Classifies changes by screen region; replaces the magnitude threshold. */
+  private tracker = new TileTracker();
+  /** Suppressed-noise counters, for observability of the classifier. */
+  private oscillatingSuppressed = 0;
+  private rhythmicSuppressed = 0;
   /**
-   * Consecutive pixel-identical samples: how long the screen has sat perfectly
-   * still. Used to tell a console that is WORKING (spinner, progress bar - never
-   * accumulates a still run) from one that merely has a clock on it (still for
-   * 59 samples out of 60). Frame STORAGE stays threshold-gated as before.
+   * Consecutive at-rest samples: pixel-identical, or blink-only churn. Used to
+   * tell a console that is WORKING (spinner, progress bar - never accumulates a
+   * still run) from one that merely has a clock or a cursor on it.
    */
   private stillSamples = 0;
   private lastNudgeAt = 0;
@@ -331,13 +404,14 @@ export class VkvmRecorder {
       intervalMs: Math.max(250, opts?.intervalMs ?? 1000),
       retentionMinutes: opts?.retentionMinutes ?? 240,
       maxFrames: opts?.maxFrames ?? 3000,
-      threshold: opts?.threshold ?? 0.0005,
       heartbeatSeconds: opts?.heartbeatSeconds ?? 60,
       deadCheckEveryTicks: Math.max(1, opts?.deadCheckEveryTicks ?? 10),
       apiCheckEveryTicks: Math.max(5, opts?.apiCheckEveryTicks ?? 60),
       antiBlankSeconds: opts?.antiBlankSeconds ?? 240,
       antiBlankMode: opts?.antiBlankMode ?? 'mouse',
       shortLivedRecoveryMs: Math.max(1, opts?.shortLivedRecoveryMs ?? 60000),
+      ocrText: opts?.ocrText ?? true,
+      ocrTimeoutMs: Math.max(100, opts?.ocrTimeoutMs ?? 30000),
     };
   }
 
@@ -367,6 +441,7 @@ export class VkvmRecorder {
     this.lastViewedSeq = 0;
     this.lastHash = null;
     this.lastPng = null;
+    this.tracker.reset();
     this.startedAt = Date.now();
     this.state = 'recording';
     this.needsInitialNudge = true;
@@ -374,6 +449,7 @@ export class VkvmRecorder {
       void this.tick();
     }, this.opts.intervalMs);
     this.timer.unref?.();
+    this.publishState();
   }
 
   stop(): void {
@@ -386,10 +462,55 @@ export class VkvmRecorder {
       this.state = 'stopped';
       this.addEvent('stopped');
     }
+    // Publish the final state so a reader in another process sees "stopped"
+    // rather than a state file that simply went quiet.
+    this.publishState();
   }
+
+  /**
+   * Publish status next to the frames for other processes to read.
+   *
+   * Called on every stored frame and every notable event, so a watcher polling
+   * the file sees changes within a second rather than waiting for a heartbeat.
+   */
+  private publishState(): void {
+    const ok = writeRecorderState(this.dir, {
+      serverMoid: path.basename(this.dir),
+      ...this.status(),
+    });
+    if (ok) {
+      this.statePublishFailures = 0;
+    } else {
+      // Counted, and reported by the next successful publish. A state file that
+      // stops advancing reads as idle, so a watcher must be able to tell "the
+      // console is quiet" from "nobody has updated this in a while" - which is
+      // what the reader's `stale` flag is for.
+      this.statePublishFailures++;
+    }
+  }
+  private statePublishFailures = 0;
+
+  // --- Console text transcript -------------------------------------------------
+  // Pixel change answers "did the screen move"; only text answers "did anything
+  // happen". A parked installer moves no pixels, and a healthy one may move
+  // barely any, so the two questions need separate signals.
+  private ocrQueue: RecordedFrame[] = [];
+  private ocrBusy = false;
+  private ocrFramesRead = 0;
+  private ocrSkipped = 0;
+  private ocrFailures = 0;
+  private textChanges = 0;
+  private transcriptLines = 0;
+  private lastText: string | null = null;
+  private lastTextChangeAt = 0;
+  /** Frames whose text differed from the previous one, for the timeline. */
+  private textChangedSeqs = new Set<number>();
 
   private addEvent(kind: RecorderEvent['kind'], detail?: string): void {
     this.events.push({ at: Date.now(), kind, detail });
+    // Every event is a state transition worth publishing immediately: a death,
+    // a recovery, a wake or a reset is exactly what a watcher waits for.
+    setImmediate(() => this.publishState());
     if (this.events.length > 200) {
       this.events.splice(0, this.events.length - 200);
     }
@@ -404,6 +525,9 @@ export class VkvmRecorder {
     this.lastHash = null;
     this.lastPng = null;
     this.stillSamples = 0;
+    // The relaunched console starts a fresh visual history: stale tile rhythms
+    // from the old session must not classify the new console's first changes.
+    this.tracker.reset();
     // A freshly relaunched console may itself be blanked - wake it immediately.
     this.needsInitialNudge = true;
     // Give the new session time to register as Active before the API backstop
@@ -625,22 +749,39 @@ export class VkvmRecorder {
           this.store(buf, now, 0, 'heartbeat');
         }
       } else {
-        // Something repainted. That may be real output or just a clock digit;
-        // the still-run is what tells those apart over time.
-        this.stillSamples = 0;
+        // Something repainted. WHERE and WHAT decide whether it matters: the
+        // tile tracker classifies each changed region as novel content, a
+        // blink returning to a known state, or a rhythmic repaint (clock,
+        // spinner). Magnitude is recorded as metadata but decides nothing - a
+        // password dot and a cursor blink measure identically (~0.0003), so no
+        // magnitude ever could.
         const png = this.decode(buf);
         if (png) {
+          const novelty = this.tracker.update(png, now);
+          this.oscillatingSuppressed += novelty.oscillatingTiles;
+          this.rhythmicSuppressed += novelty.rhythmicTiles;
+          // A screen whose only motion is a blink is AT REST: without this, a
+          // blinking cursor on an idle login prompt resets the still-run every
+          // second and anti-blank never fires on exactly the console most
+          // likely to blank.
+          if (novelty.changedTiles === novelty.oscillatingTiles) {
+            this.stillSamples++;
+          } else {
+            this.stillSamples = 0;
+          }
           const ratio = this.sampledDiff(this.lastPng, png);
           this.lastHash = hash;
           this.lastPng = png;
 
           if (this.frames.length === 0) {
             this.store(buf, now, 0, 'first');
-            this.lastChangeAt = now;
-          } else if (ratio > this.opts.threshold) {
+          } else if (novelty.novelTiles > 0) {
             this.store(buf, now, ratio, 'change');
-            this.lastChangeAt = now;
+            this.lastNoveltyAt = now;
           } else if (heartbeatDue) {
+            // Blink- or rhythm-only churn: kept visible via the heartbeat, so
+            // a clock or spinner still appears in the record about once a
+            // minute without flooding it.
             this.store(buf, now, ratio, 'heartbeat');
           }
         }
@@ -680,7 +821,7 @@ export class VkvmRecorder {
       mode: this.opts.antiBlankMode,
       state: this.state,
       needsInitialNudge: this.needsInitialNudge,
-      lastChangeAt: this.lastChangeAt,
+      lastNoveltyAt: this.lastNoveltyAt,
       lastNudgeAt: this.lastNudgeAt,
       startedAt: this.startedAt,
       stillSamples: this.stillSamples,
@@ -763,18 +904,167 @@ export class VkvmRecorder {
     });
     this.lastStoredAt = at;
     this.prune();
+    this.enqueueOcr(this.frames[this.frames.length - 1]);
+    this.publishState();
+  }
+
+  /**
+   * Queue a stored frame for text recognition.
+   *
+   * EVERY stored frame, including heartbeats — deliberately not gated on change
+   * magnitude. A one-line error moves 0.001-0.0026 of the screen and may only
+   * ever appear on a heartbeat frame; whereas the frames with huge change
+   * ratios (full-screen repaints) carry the least readable text. Gating on
+   * magnitude would read the wrong frames.
+   */
+  private enqueueOcr(frame: RecordedFrame | undefined): void {
+    if (!frame || !this.hooks.ocrFrame || !this.opts.ocrText) {
+      return;
+    }
+    this.ocrQueue.push(frame);
+    while (this.ocrQueue.length > MAX_OCR_QUEUE) {
+      this.ocrQueue.shift();
+      this.ocrSkipped++;
+    }
+    void this.pumpOcr();
+  }
+
+  /**
+   * Read queued frames one at a time, appending to the transcript whenever the
+   * text actually changed.
+   *
+   * Serial by design: recognition is CPU-heavy and several recorders share one
+   * worker. Failures are counted and never propagate — OCR enriches the
+   * recording, it must not be able to stop it.
+   */
+  private async pumpOcr(): Promise<void> {
+    if (this.ocrBusy || !this.hooks.ocrFrame) {
+      return;
+    }
+    this.ocrBusy = true;
+    try {
+      while (this.ocrQueue.length > 0 && this.timer) {
+        const frame = this.ocrQueue.shift()!;
+        // The ring buffer may have deleted it while it waited.
+        if (!fs.existsSync(frame.path)) {
+          this.ocrSkipped++;
+          continue;
+        }
+        let raw: string | null = null;
+        try {
+          // Bounded deliberately: a previous engine was observed to fail to
+          // settle. An unbounded await here would park the queue permanently -
+          // no transcript, no text signal, and no error - leaving the recorder
+          // looking healthy while its most useful signal silently stopped.
+          raw = await this.withOcrTimeout(this.hooks.ocrFrame(frame.path));
+        } catch {
+          this.ocrFailures++;
+          continue;
+        }
+        if (raw === null) {
+          this.ocrFailures++;
+          continue;
+        }
+        this.ocrFramesRead++;
+        // A screen with no legible text reads as '' rather than as whatever
+        // character OCR imagined this time - see MIN_MEANINGFUL_TEXT_CHARS.
+        const text = meaningfulText(raw);
+        if (text === this.lastText) {
+          continue; // pixels moved, words did not
+        }
+        if (text === '' && this.lastText === null) {
+          this.lastText = ''; // first frame is blank: that is the baseline, not news
+          continue;
+        }
+        this.lastText = text;
+        if (text === '') {
+          // The text going away IS an event (a screen clearing, a blank), but
+          // there is nothing to transcribe.
+          this.textChanges++;
+          this.lastTextChangeAt = frame.at;
+          this.textChangedSeqs.add(frame.seq);
+          continue;
+        }
+        this.textChanges++;
+        this.lastTextChangeAt = frame.at;
+        this.textChangedSeqs.add(frame.seq);
+        this.appendTranscript(frame, text);
+      }
+    } finally {
+      this.ocrBusy = false;
+    }
+  }
+
+  /** Reject rather than hang if recognition does not come back. */
+  private async withOcrTimeout(work: Promise<string | null>): Promise<string | null> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('OCR timed out')), this.opts.ocrTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  private appendTranscript(frame: RecordedFrame, text: string): void {
+    const file = path.join(this.dir, OCR_TEXT_FILENAME);
+    try {
+      fs.appendFileSync(
+        file,
+        `${JSON.stringify({
+          seq: frame.seq,
+          at: new Date(frame.at).toISOString(),
+          frame: path.basename(frame.path),
+          changeRatio: frame.changeRatio,
+          text,
+        })}\n`
+      );
+      // Bounded like everything else that grows on a timer: keep the newest half
+      // rather than letting a long run fill the disk unnoticed.
+      if (++this.transcriptLines > MAX_TRANSCRIPT_LINES) {
+        const kept = fs
+          .readFileSync(file, 'utf8')
+          .split('\n')
+          .filter((l) => l.trim())
+          .slice(-Math.floor(MAX_TRANSCRIPT_LINES / 2));
+        fs.writeFileSync(file, `${kept.join('\n')}\n`);
+        this.transcriptLines = kept.length;
+      }
+    } catch {
+      // A transcript we cannot write must not stop recording.
+    }
   }
 
   private prune(): void {
     const cutoff = Date.now() - this.opts.retentionMinutes * 60000;
     while (this.frames.length > 0 && (this.frames.length > this.opts.maxFrames || this.frames[0].at < cutoff)) {
       const dropped = this.frames.shift()!;
+      // Counted and surfaced: a long campaign silently lost ~60% of its console
+      // evidence to the ring buffer, and the first sign was frames simply not
+      // being there when they were wanted. The buffer starting to roll is worth
+      // knowing about while there is still time to raise retention or export.
+      this.framesEvicted++;
+      if (!this.evictionStartedAt) {
+        this.evictionStartedAt = Date.now();
+      }
       try {
         fs.unlinkSync(dropped.path);
       } catch {
         // already gone
       }
     }
+  }
+
+  /** Every retained frame, oldest first. A copy, so callers cannot mutate the buffer. */
+  allFrames(): RecordedFrame[] {
+    return [...this.frames];
   }
 
   /** Frames whose seq is newer than the last batch handed to the agent. */
@@ -881,6 +1171,10 @@ export class VkvmRecorder {
         sinceStartSec: Math.round((row.at - this.startedAt) / 100) / 10,
         ...(row.changeRatio !== undefined ? { changeRatio: row.changeRatio } : {}),
         reason: row.reason,
+        // The frames where the WORDS changed, not just the pixels. A tiny
+        // changeRatio with textChanged is a new line of output; a large one
+        // without it is usually a repaint.
+        ...(row.seq !== undefined && this.textChangedSeqs.has(row.seq) ? { textChanged: true } : {}),
         ...(row.detail ? { detail: row.detail } : {}),
         ...(row.path ? { path: row.path } : {}),
       }));
@@ -913,8 +1207,16 @@ export class VkvmRecorder {
       recentEvents: this.events.slice(-8).map((e) => ({ at: new Date(e.at).toISOString(), kind: e.kind, detail: e.detail })),
       intervalMs: this.opts.intervalMs,
       retentionMinutes: this.opts.retentionMinutes,
-      threshold: this.opts.threshold,
       heartbeatSeconds: this.opts.heartbeatSeconds,
+      // WHEN something genuinely new last appeared on the console — the wedge
+      // predicate. Blink and clock/spinner repaints are classified out, so a
+      // machine doing nothing reads as idle even with a clock on screen.
+      novelty: {
+        lastNoveltyAt: this.lastNoveltyAt ? new Date(this.lastNoveltyAt).toISOString() : null,
+        secondsSinceNovelty: this.lastNoveltyAt ? Math.round((Date.now() - this.lastNoveltyAt) / 1000) : null,
+        oscillatingSuppressed: this.oscillatingSuppressed,
+        rhythmicSuppressed: this.rhythmicSuppressed,
+      },
       startedAt: this.startedAt ? new Date(this.startedAt).toISOString() : null,
       framesStored: this.frames.length,
       changeFrames: this.frames.filter((f) => f.reason === 'change').length,
@@ -923,6 +1225,34 @@ export class VkvmRecorder {
       oldestFrameAt: this.frames.length ? new Date(this.frames[0].at).toISOString() : null,
       newestFrameAt: this.frames.length ? new Date(this.frames[this.frames.length - 1].at).toISOString() : null,
       newChangesSinceLastView: this.newFramesSinceLastView(),
+      ...(this.statePublishFailures > 0 ? { statePublishFailures: this.statePublishFailures } : {}),
+      // Content-stillness, as distinct from pixel-stillness. `pending` and
+      // `skipped` exist so "the transcript shows no error" can never be mistaken
+      // for "every frame was read".
+      ocr: {
+        enabled: !!this.hooks.ocrFrame && this.opts.ocrText,
+        framesRead: this.ocrFramesRead,
+        textChanges: this.textChanges,
+        lastTextChangeAt: this.lastTextChangeAt ? new Date(this.lastTextChangeAt).toISOString() : null,
+        secondsSinceTextChange: this.lastTextChangeAt
+          ? Math.round((Date.now() - this.lastTextChangeAt) / 1000)
+          : null,
+        pending: this.ocrQueue.length,
+        skipped: this.ocrSkipped,
+        failures: this.ocrFailures,
+        transcript: path.join(this.dir, OCR_TEXT_FILENAME),
+      },
+      framesEvicted: this.framesEvicted,
+      evictionStartedAt: this.evictionStartedAt ? new Date(this.evictionStartedAt).toISOString() : null,
+      ...(this.framesEvicted > 0
+        ? {
+            evictionNote:
+              `The ring buffer is rolling: ${this.framesEvicted} frame(s) older than ` +
+              `${this.opts.retentionMinutes} minutes have been deleted and cannot be recovered. ` +
+              `For a run longer than that, raise retentionMinutes (settable on launch_vkvm_session ` +
+              `and vkvm_record_start) or archive frames with vkvm_export.`,
+          }
+        : {}),
       captureErrors: this.captureErrors,
       lastError: this.lastError,
     };

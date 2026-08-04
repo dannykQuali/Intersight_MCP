@@ -41,5 +41,6 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Tesseract OCR language data, downloaded at runtime by tesseract.js
+# OCR language data downloaded at runtime by the former tesseract.js engine;
+# kept so a stale eng.traineddata on a dev machine never gets committed.
 *.traineddata

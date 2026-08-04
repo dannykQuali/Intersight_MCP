@@ -12,9 +12,8 @@ import { afterEach, describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PNG } from 'pngjs';
 import { VkvmRecorder } from '../src/services/vkvmRecorder.js';
-import { FakeConsolePage, solidPng, waitFor } from './helpers/fakeConsolePage.js';
+import { FakeConsolePage, movingMarkFrame, solidPng, waitFor } from './helpers/fakeConsolePage.js';
 
 const dirs: string[] = [];
 const recorders: VkvmRecorder[] = [];
@@ -35,35 +34,17 @@ function tempDir(): string {
 }
 
 /**
- * A frame differing from `solidPng(0)` by a single pixel.
- *
- * Sized so the difference is BELOW the change threshold, like a real clock
- * digit: the recorder samples every 4th pixel, so 200x200 gives 2500 sampled
- * pixels and one of them is 0.0004 - under the 0.0005 default.
+ * Recorder over a console with controllable "activity", scaled down from
+ * reality: a 2s anti-blank window (8 samples) instead of 240s.
  */
-function oneDifferentPixel(): Buffer {
-  const png = PNG.sync.read(solidPng(0, 200, 200));
-  png.data[0] = 255;
-  png.data[1] = 255;
-  png.data[2] = 255;
-  return PNG.sync.write(png);
-}
-
-/**
- * Recorder over a console that repaints on a fixed period, scaled down from
- * reality: a 2s anti-blank window (8 samples) against a "clock" that ticks
- * every 6 samples - the same shape as 240s against a 60s clock.
- */
-function tickingConsoleRecorder(samplesPerRepaint: number) {
-  const frames = [solidPng(0, 200, 200), oneDifferentPixel()];
-  const page = new FakeConsolePage(frames[0]);
+function consoleRecorder(nextFrame: (sample: number) => Buffer | null) {
+  const page = new FakeConsolePage(solidPng(0, 200, 200));
   let samples = 0;
-  let which = 0;
   const originalScreenshot = page.screenshot.bind(page);
   page.screenshot = async () => {
-    if (samplesPerRepaint > 0 && ++samples % samplesPerRepaint === 0) {
-      which ^= 1;
-      page.setFrame(frames[which]);
+    const frame = nextFrame(++samples);
+    if (frame) {
+      page.setFrame(frame);
     }
     return originalScreenshot();
   };
@@ -85,19 +66,26 @@ function tickingConsoleRecorder(samplesPerRepaint: number) {
 }
 
 describe('VkvmRecorder anti-blank', () => {
-  it('keeps nudging a console whose only activity is a periodic repaint', async () => {
-    const { recorder, nudges } = tickingConsoleRecorder(6);
+  it('keeps nudging a console whose only motion is a blink', async () => {
+    // Two frames toggling — a cursor. The classifier calls it oscillating, so
+    // the console counts as at rest and anti-blank keeps protecting it. (Under
+    // the old rule the blink reset the still-run every cycle and this console
+    // - an idle login prompt, the one MOST likely to blank - was never nudged.)
+    const a = solidPng(0, 200, 200);
+    const b = movingMarkFrame(1);
+    const { recorder, nudges } = consoleRecorder((n) => (n % 6 === 0 ? (Math.floor(n / 6) % 2 ? b : a) : null));
     recorder.start();
 
     // The first nudge is the on-attach one; the second proves the idle rule
     // survived a screen that never stops repainting.
-    await waitFor(() => nudges.length >= 2, 10000, 'a second nudge on a ticking console');
+    await waitFor(() => nudges.length >= 2, 10000, 'a second nudge on a blinking console');
     assert.equal(recorder.status().antiBlank.nudgesSent, nudges.length);
   });
 
   it('never nudges a console that is actively working', async () => {
-    // Repaints on every single sample: an installer progress bar or a spinner.
-    const { recorder, nudges } = tickingConsoleRecorder(1);
+    // Genuinely new content on every sample, landing in fresh places — an
+    // installer writing output. Novelty keeps refreshing, so no nudge.
+    const { recorder, nudges } = consoleRecorder((n) => movingMarkFrame(n));
     recorder.start();
 
     await waitFor(() => nudges.length >= 1, 5000, 'the on-attach nudge');

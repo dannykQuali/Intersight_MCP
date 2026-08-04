@@ -3594,7 +3594,20 @@ export class IntersightMCPServer {
             },
             forceNew: {
               type: 'boolean',
-              description: 'Force a fresh session even if one is already open for this server (closes the existing tab first, waits for the server to free the single session slot, then relaunches). Default: false (reuse a live session).',
+              description: 'Force a fresh session even if one is already open for this server (closes the existing tab first, waits for the server to free the single session slot, then relaunches). Default: false (reuse a live session). Also the remedy when a live console stops accepting keyboard/mouse input: it rebuilds the input channel.',
+            },
+            recording: {
+              type: 'object',
+              description:
+                'Options for the recorder that starts automatically with the session. Set retentionMinutes to cover your whole run — the default keeps 4 hours and older frames are deleted for good.',
+              properties: {
+                retentionMinutes: { type: 'number', description: 'Minutes of frames to keep (default 240 = 4h)' },
+                intervalMs: { type: 'number', description: 'Sampling interval in ms (default 1000, minimum 250)' },
+                heartbeatSeconds: { type: 'number', description: 'Store a frame at least this often when idle (default 60)' },
+                maxFrames: { type: 'number', description: 'Hard cap on retained frames (default 3000)' },
+                antiBlankSeconds: { type: 'number', description: 'Nudge an idle console this often, seconds (default 240; 0 disables)' },
+                antiBlankMode: { type: 'string', enum: ['mouse', 'key', 'none'], description: 'How to nudge (default mouse)' },
+              },
             },
           },
           required: ['serverMoid'],
@@ -3619,13 +3632,16 @@ export class IntersightMCPServer {
       },
       {
         name: 'browser_send_keys',
-        description: 'Send keyboard input to a browser page (e.g. type into a vKVM console). "text" is typed literally; "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete".',
+        description:
+          'Send keyboard input to a browser page (e.g. type into a vKVM console). "text" is typed literally as US-layout keystrokes — uppercase and symbols are delivered with a real held Shift, so passwords like "Cisco123!" arrive intact; characters with no US keystroke (e.g. accented letters) are rejected loudly rather than silently mangled. "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete". ' +
+          'Also VERIFIES delivery: it reports consoleFocused, watches for the console to react, and warns if nothing changed — "sent" alone would only mean the event was dispatched locally, which once masked a session whose input channel had silently died. To catch a prompt that only appears briefly, or to retry until the screen reacts, use vkvm_press_until instead of calling this in a loop.',
         inputSchema: {
           type: 'object',
           properties: {
             serverMoid: {
               type: 'string',
-              description: 'Target the vKVM page of this server (default: the most recently opened tab)',
+              description:
+                'Target the vKVM page of this server. Omitting it targets the most recently opened tab, which is the wrong server surprisingly often when several sessions are open — pass it whenever you know it.',
             },
             text: {
               type: 'string',
@@ -3636,21 +3652,34 @@ export class IntersightMCPServer {
               items: { type: 'string' },
               description: 'Special keys / combos to press after the text, e.g. ["Enter"] or ["Control+Alt+Delete"]',
             },
+            verifyMs: {
+              type: 'number',
+              description:
+                'How long to watch for the console to react, in ms (default 1500). Set 0 to skip the check for input that is not expected to draw anything, e.g. a bare modifier.',
+            },
           },
         },
       },
       {
         name: 'browser_mouse',
-        description: 'Send mouse input to a browser page. Coordinates match what browser_screenshot shows (viewport pixels, top-left = 0,0) — click where you see things in the screenshot.',
+        description:
+          'Send mouse input to a browser page. Coordinates are UNSCALED viewport pixels (top-left = 0,0), matching what browser_screenshot returns — click where you see things in a browser_screenshot. ' +
+          'CAUTION: vkvm_recent / vkvm_frames_at frames are DOWNSCALED by default (scale 0.7), so coordinates read off those are NOT interchangeable with these — passing them directly lands the click 30-50% off, which looks exactly like "input is not being delivered". Either pass fromScale with the scale that frame was rendered at, or read coordinates off a full-size browser_screenshot.',
         inputSchema: {
           type: 'object',
           properties: {
             serverMoid: {
               type: 'string',
-              description: 'Target the vKVM page of this server (default: the most recently opened tab)',
+              description:
+                'Target the vKVM page of this server. Omitting it targets the most recently opened tab, which is the wrong server surprisingly often when several sessions are open — pass it whenever you know it.',
             },
             x: { type: 'number', description: 'X coordinate in pixels' },
             y: { type: 'number', description: 'Y coordinate in pixels' },
+            fromScale: {
+              type: 'number',
+              description:
+                'Set this when x/y were read off a SCALED recorded frame (e.g. 0.7 for a default vkvm_recent filmstrip, 0.5 if you asked for scale 0.5). The coordinates are divided by it to get page pixels. Omit when reading off a full-size browser_screenshot.',
+            },
             action: {
               type: 'string',
               enum: ['click', 'doubleclick', 'move', 'down', 'up'],
@@ -3736,7 +3765,9 @@ export class IntersightMCPServer {
       },
       {
         name: 'reset_tunneled_vkvm',
-        description: 'Fix the Intersight bug where launching a tunneled vKVM session immediately shows "KVM session has ended": disables Tunneled vKVM on the server and re-enables it (waiting for each "Update Tunneled vKVM" workflow to complete, ~30s total). Run this when launch_vkvm_session produces a dead/ended console, then launch again.',
+        description:
+          'ONE PURPOSE ONLY: the Intersight bug where a tunneled vKVM session CAN be created but is born dead — launch_vkvm_session succeeds and the console immediately reads "KVM session has ended. Please close the window." This disables Tunneled vKVM on the server and re-enables it (~60-90s, two workflows plus settle time), after which launching works. ' +
+          'It is USELESS FOR ANYTHING ELSE and costs a minute-plus of server-settings churn, so do not reach for it as a general repair: not for a console whose video works but whose keyboard/mouse seem dead (relaunch instead: launch_vkvm_session forceNew:true, which rebuilds the input channel), not for the green "No Signal" screens (User Inactivity wants a keypress; a dropped connection wants a relaunch; "Host power is off" wants the server powering on), not for a login/session-expiry failure (browser_login), not for a wedged or crashed guest OS (that is the server, not the console), and not for a slow or blank-looking install (check vkvm_timeline / vkvm_find_text first). If a tunneled session cannot be opened at all, this will not help either — check the Advantage license and the Launch vKVM privilege.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3790,7 +3821,9 @@ export class IntersightMCPServer {
       },
       {
         name: 'vkvm_recent',
-        description: 'Get the most recent CONSOLE FRAMES from the continuous background recording as a filmstrip of images — the primary way to see what a server did while you were not looking. Recording starts automatically with launch_vkvm_session and samples every second, keeping every frame in which the screen changed. Prefer this over a single browser_screenshot when monitoring: one screenshot is a point sample and will miss reboots, transient prompts and error messages. Returns oldest-first with a timestamp and change ratio per frame.',
+        description:
+          'Get the most recent CONSOLE FRAMES from the continuous background recording as a filmstrip of images — the primary way to see what a server did while you were not looking. Recording starts automatically with launch_vkvm_session and samples every second, keeping every frame in which the screen changed. Prefer this over a single browser_screenshot when monitoring: one screenshot is a point sample and will miss reboots, transient prompts and error messages. Returns oldest-first with a timestamp and change ratio per frame. ' +
+          'This spends IMAGE TOKENS, so on a routine monitoring tick check vkvm_timeline (free) and vkvm_find_text (free, OCR-searches for "ERROR|FAILED|press any key") first, and come here once you know something happened. Frames are downscaled — see fromScale on browser_mouse before clicking on coordinates read off one.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3862,15 +3895,19 @@ export class IntersightMCPServer {
       },
       {
         name: 'vkvm_record_start',
-        description: 'Start continuously recording a server console (normally automatic on launch_vkvm_session). Samples every second and stores every changed frame to a disk ring buffer, so nothing is missed between your looks.',
+        description:
+          'Start continuously recording a server console (normally automatic on launch_vkvm_session). Samples every second and stores every frame in which something NEW appeared — content is classified per screen region, so a one-pixel password dot is kept while cursor blink and clock/spinner repaints are recognised and skipped; there is no sensitivity to tune. Also builds a TEXT TRANSCRIPT of the console as it records (text.jsonl beside the frames), which is what distinguishes a wedged machine from a slow one — pixel stillness alone cannot.',
         inputSchema: {
           type: 'object',
           properties: {
             serverMoid: { type: 'string', description: 'MOID of the server whose console to record' },
             intervalMs: { type: 'number', description: 'Sampling interval in ms (default 1000, minimum 250)' },
-            retentionMinutes: { type: 'number', description: 'How long to keep frames, in minutes (default 240 = 4h, sized so a long OS install fits). Raise it for installs longer than that; budget roughly 10MB per hour per idle console.' },
+            retentionMinutes: {
+              type: 'number',
+              description:
+                'How long to keep frames, in minutes (default 240 = 4h). Frames older than this are DELETED and unrecoverable, so set it to cover your whole run: a 10-hour campaign on the default silently lost ~60% of its console evidence. Budget ~10MB/hour for an idle text console and ~23MB/hour for a GUI (measured on a Windows install).',
+            },
             maxFrames: { type: 'number', description: 'Hard cap on retained frames (default 3000)' },
-            threshold: { type: 'number', description: 'Change fraction that counts as a real change (default 0.002)' },
             heartbeatSeconds: { type: 'number', description: 'Store a frame at least this often even when idle (default 60)' },
             antiBlankSeconds: {
               type: 'number',
@@ -3881,8 +3918,32 @@ export class IntersightMCPServer {
               enum: ['mouse', 'key', 'none'],
               description: 'How to nudge: "mouse" (default, a 1px pointer move — cannot type or click, and bootloaders ignore it), "key" (also taps Shift; wakes a blanked Linux text console more reliably but can drop some distros into the GRUB menu during early boot), or "none".',
             },
+            ocrText: {
+              type: 'boolean',
+              description:
+                'Recognise the text of every stored frame into a transcript beside them (default true). Costs ~1s of CPU per stored frame — nothing on an idle console, real work during an install — and is what lets you tell a parked installer from a slow one. Set false to record pixels only.',
+            },
           },
           required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_export',
+        description:
+          'Copy recorded console frames OUT of the ring buffer into a directory of your choice, so they survive it. The recording is a rolling window (default 4h) that deletes older frames permanently — export before that happens if the frames are test evidence. Files are named by timestamp so they sort chronologically alongside other logs. Use minChangeRatio to archive only the structural moments (reboots, error dialogs) instead of every heartbeat.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            destDir: { type: 'string', description: 'Directory to copy frames into (created if missing)' },
+            from: { type: 'string', description: 'Only frames at/after this ISO timestamp (or epoch ms). Default: oldest retained.' },
+            to: { type: 'string', description: 'Only frames at/before this ISO timestamp (or epoch ms). Default: now.' },
+            minChangeRatio: {
+              type: 'number',
+              description: 'Only frames whose change magnitude is at least this (0..1). Try 0.05 for structural events only.',
+            },
+          },
+          required: ['serverMoid', 'destDir'],
         },
       },
       {
@@ -3896,7 +3957,9 @@ export class IntersightMCPServer {
       },
       {
         name: 'vkvm_record_status',
-        description: 'Report recording state: frames stored, disk used, capture errors, recoveries/wakes, retention window, and how many console changes occurred since you last viewed frames. OMIT serverMoid to LIST EVERY ACTIVE RECORDER — use this to rediscover which servers you are recording after losing track (e.g. after context compaction); the returned serverMoid values are what the other vkvm_* tools take.',
+        description:
+          'Report recording state: frames stored, disk used, capture errors, recoveries/wakes, retention window, frames EVICTED by the ring buffer, and how many console changes occurred since you last viewed frames. OMIT serverMoid to LIST EVERY ACTIVE RECORDER — use this to rediscover which servers you are recording after losing track (e.g. after context compaction); the returned serverMoid values are what the other vkvm_* tools take. ' +
+          'Also reports recordersInOtherProcesses: recorders owned by a DIFFERENT MCP server process, read from the status each one publishes beside its frames (stale entries are labelled, and a recorder that has gone quiet is never reported as live). Those are read-only from here — stopping them or fetching their frames needs the process that owns them. Each recorder also republishes that status to <recordingDir>/<serverMoid>/state.json on every stored frame and event, so a background command can poll it and notify you instead of you polling this tool.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -5170,7 +5233,10 @@ export class IntersightMCPServer {
 
       case 'launch_vkvm_session': {
         const server = await this.resolvePhysicalServer(args.serverMoid);
-        return this.getBrowserService().launchVkvm(server, { forceNew: args.forceNew });
+        return this.getBrowserService().launchVkvm(server, {
+          forceNew: args.forceNew,
+          recording: args.recording,
+        });
       }
 
       case 'browser_screenshot': {
@@ -5178,17 +5244,14 @@ export class IntersightMCPServer {
           serverMoid: args.serverMoid,
           fullPage: args.fullPage,
         });
+        // Everything except the base64 payload, which is already the image part.
+        // This used to hand-pick three fields, silently dropping missedChanges
+        // (and later noSignal) even though the docs said they were reported here.
+        const { base64: _omit, ...details } = shot as Record<string, unknown> & { base64: string };
         return {
           __mcpContent: [
             { type: 'image', data: shot.base64, mimeType: 'image/png' },
-            {
-              type: 'text',
-              text: JSON.stringify(
-                { path: shot.path, url: shot.url, changeSinceLastShot: shot.changeSinceLastShot },
-                null,
-                2
-              ),
-            },
+            { type: 'text', text: JSON.stringify(details, null, 2) },
           ],
         };
       }
@@ -5198,6 +5261,7 @@ export class IntersightMCPServer {
           serverMoid: args.serverMoid,
           text: args.text,
           keys: args.keys,
+          verifyMs: args.verifyMs,
         });
 
       case 'browser_mouse':
@@ -5208,6 +5272,7 @@ export class IntersightMCPServer {
           action: args.action,
           button: args.button,
           relativeTo: args.relativeTo,
+          fromScale: args.fromScale,
         });
 
       case 'browser_goto':
@@ -5254,10 +5319,19 @@ export class IntersightMCPServer {
           intervalMs: args.intervalMs,
           retentionMinutes: args.retentionMinutes,
           maxFrames: args.maxFrames,
-          threshold: args.threshold,
           heartbeatSeconds: args.heartbeatSeconds,
           antiBlankSeconds: args.antiBlankSeconds,
           antiBlankMode: args.antiBlankMode,
+          ocrText: args.ocrText,
+        });
+
+      case 'vkvm_export':
+        return this.getBrowserService().exportFrames({
+          serverMoid: args.serverMoid,
+          destDir: args.destDir,
+          from: args.from,
+          to: args.to,
+          minChangeRatio: args.minChangeRatio,
         });
 
       case 'vkvm_record_stop':

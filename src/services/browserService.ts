@@ -20,9 +20,11 @@
  * SOFTWARE.
  */
 
+import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import { spawn } from 'child_process';
 import { chromium, Browser, BrowserContext, Page } from 'playwright-core';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
@@ -30,6 +32,19 @@ import { loadSsoConfig, SsoConfig } from '../utils/config.js';
 import { VkvmRecorder, RecordedFrame, RecorderHooks, RecorderOptions } from './vkvmRecorder.js';
 import { FrameOcr } from './frameOcr.js';
 import { AgentInputTracker } from './agentInputTracker.js';
+import { readRecorderState } from './recorderState.js';
+import {
+  classifyNoSignal,
+  noSignalGreenFraction,
+  NoSignalState,
+  NO_SIGNAL_GREEN_THRESHOLD,
+} from './consoleSignals.js';
+import { fromScaledFrame } from '../utils/frameCoords.js';
+import { consoleFocusPageScript } from '../utils/consoleFocus.js';
+import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
+
+/** What focusConsole managed to focus, named so a failure is diagnosable. */
+type ConsoleFocusResult = { focused: boolean; target: string | null; isConsoleCanvas: boolean };
 import { generateTotp, parseTotpConfig, secondsRemainingInWindow, TotpParams } from '../utils/totp.js';
 
 export interface SessionApiResult {
@@ -75,11 +90,10 @@ export class BrowserService {
   private loginFailures = 0;
   private static readonly MAX_LOGIN_FAILURES = 3;
   private loginDisabledReason: string | null = null;
-  // A browser profile can only be owned by ONE Chromium process, so a second MCP
-  // server instance ATTACHES to the running browser over CDP instead of
-  // launching a competing one. ownsContext=false means we attached and must not
-  // close it (another instance — possibly driving a live console — owns it).
-  private ownsContext = false;
+  // The shared browser is a DETACHED OS process owned by no MCP instance: every
+  // instance attaches to it over CDP (a profile can only be owned by one
+  // Chromium process), and none of them can take it down by exiting. This
+  // handle is our CDP connection to it.
   private attachedBrowser: Browser | null = null;
   private adoptedKvmTabs: string[] = [];
   // Continuous console recorders, one per server MOID.
@@ -151,7 +165,6 @@ export class BrowserService {
         return null;
       }
       this.attachedBrowser = browser;
-      this.ownsContext = false;
       return ctx;
     } catch {
       return null;
@@ -217,34 +230,76 @@ export class BrowserService {
       return this.context;
     }
 
-    // 2. Otherwise launch it ourselves. --remote-debugging-port=0 makes Chromium
-    //    publish a DevToolsActivePort file so later instances can attach (port 0
-    //    = OS-assigned; bound to localhost).
-    const channels: (string | undefined)[] = ['msedge', 'chrome', undefined];
-    let lastError: unknown = null;
-    for (const channel of channels) {
-      try {
-        this.context = await chromium.launchPersistentContext(this.profileDir, {
-          channel,
-          headless: false,
-          viewport: viewport ?? { width: 1600, height: 900 },
-          ignoreDefaultArgs: ['--enable-automation'],
-          args: ['--disable-blink-features=AutomationControlled', '--remote-debugging-port=0'],
-        });
-        this.ownsContext = true;
-        break;
-      } catch (error) {
-        lastError = error;
-      }
+    // 2. Otherwise spawn a browser DETACHED and attach to it over CDP, exactly
+    //    as if another instance had launched it.
+    //
+    //    Not launchPersistentContext: Playwright closes a browser it launched
+    //    when its Node process exits, and this MCP server restarts every time
+    //    its code is reloaded. With several MCP instances sharing one browser,
+    //    whichever instance happened to launch it became a hidden single point
+    //    of failure — verified painfully: another agent's live console sessions
+    //    died mid-use, twice, each time this server's window was restarted.
+    //    A detached OS process is owned by nobody; every instance (including
+    //    this one) is just an attacher, and restarts kill nothing.
+    await this.spawnDetachedBrowser(viewport);
+    const spawned = await this.tryAttach();
+    if (!spawned) {
+      throw new Error(
+        'Spawned a browser but could not attach to it (DevToolsActivePort never became connectable).'
+      );
     }
-    if (!this.context) {
-      throw new Error(`Failed to launch a browser (tried Edge, Chrome, bundled Chromium): ${lastError}`);
-    }
+    this.context = spawned;
     this.context.on('close', () => {
       this.context = null;
       this.kvmPages.clear();
     });
     return this.context;
+  }
+
+  /**
+   * Start the shared browser as a detached OS process on our profile, with a
+   * CDP port published in DevToolsActivePort, and wait until it is attachable.
+   */
+  private async spawnDetachedBrowser(viewport?: { width: number; height: number }): Promise<void> {
+    const exe = findBrowserExecutable();
+    if (!exe) {
+      throw new Error(
+        'No Edge or Chrome installation found to launch. Install one, or start a browser on the profile manually.'
+      );
+    }
+    // A stale port file would make the post-spawn attach race against the old
+    // dead port; remove it and wait for the NEW browser to write a fresh one.
+    const portFile = path.join(this.profileDir, 'DevToolsActivePort');
+    try {
+      fs.unlinkSync(portFile);
+    } catch {
+      /* none there */
+    }
+    const size = viewport ?? { width: 1600, height: 900 };
+    const child = spawn(
+      exe,
+      [
+        `--user-data-dir=${this.profileDir}`,
+        '--remote-debugging-port=0',
+        '--disable-blink-features=AutomationControlled',
+        `--window-size=${size.width},${size.height}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        'about:blank',
+      ],
+      { detached: true, stdio: 'ignore' }
+    );
+    // Fully disown it: the whole point is that it outlives this process.
+    child.unref();
+
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      if (this.devtoolsEndpoint()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`Browser started (${path.basename(exe)}) but never published DevToolsActivePort.`);
   }
 
   /** Open the browser window and navigate to the Intersight login page. */
@@ -402,9 +457,8 @@ export class BrowserService {
       loggedIn: await this.isLoggedIn(),
       pages,
       kvmSessions: [...this.kvmPages.keys()],
-      browserOwnership: this.ownsContext
-        ? 'launched-by-this-instance'
-        : 'attached-to-another-instance (shared; browser_close will only detach)',
+      browserOwnership:
+        'detached (the browser is a shared OS process owned by no MCP instance; it survives every instance restart, and browser_close only detaches)',
       ...(this.adoptedKvmTabs.length ? { adoptedKvmTabs: this.adoptedKvmTabs } : {}),
       autoLogin: this.autoLoginStatus(),
     };
@@ -1150,37 +1204,58 @@ export class BrowserService {
    * directly cuts that dead time.
    */
   private async isConsoleDisconnected(page: Page): Promise<'inactivity' | 'dropped' | null> {
-    if (page.isClosed()) {
-      return 'dropped';
-    }
-    const state = await page
-      .evaluate(
-        `(() => {
-          // Two DIFFERENT green "No Signal" screens needing OPPOSITE remedies:
-          //   "Reason: User Inactivity. Press a key to wake up the system."
-          //       -> the host video is asleep. Relaunching does nothing; the
-          //          screen literally tells you the fix: send a key.
-          //   "Reason: Connection to server dropped..."
-          //       -> the tunnel died. Only a relaunch recovers it.
-          const INACTIVE = /User Inactivity|Press a key to wake/i;
-          const DROPPED = /Connection to server dropped|attempting to reconnect/i;
-          const find = (root, RE) => {
-            if (!root) return false;
-            const t = root.textContent;
-            if (t && RE.test(t)) return true;
-            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-            for (const el of all) { if (el.shadowRoot && find(el.shadowRoot, RE)) return true; }
-            return false;
-          };
-          if (!document.body) return null;
-          if (find(document.body, INACTIVE)) return 'inactivity';
-          if (find(document.body, DROPPED)) return 'dropped';
-          return null;
-        })()`
-      )
-      .catch(() => null);
-    return (state as 'inactivity' | 'dropped' | null) ?? null;
+    const state = await this.consoleNoSignal(page);
+    return state.kind === 'inactivity' || state.kind === 'dropped' ? state.kind : null;
   }
+
+  /**
+   * Read the console's green "No Signal" screen, if any, and say what it means.
+   *
+   * Richer than isConsoleDisconnected, which only reports the two states the
+   * recorder can act on. A third exists - "Reason: Host power is off" - that
+   * needs no remedy but must not be reported as a healthy console: a recorder
+   * was observed sitting on it for hours while everything looked fine.
+   */
+  private async consoleNoSignal(page: Page, frame?: Buffer): Promise<NoSignalState> {
+    if (page.isClosed()) {
+      return {
+        blanked: true,
+        kind: 'dropped',
+        reason: 'the vKVM tab is closed',
+        remedy: 'Relaunch with launch_vkvm_session.',
+      };
+    }
+    const buf = frame ?? (await page.screenshot().catch(() => null));
+    const png = buf ? this.decodePng(buf) : null;
+    if (!png) {
+      return { blanked: false, kind: null, reason: null, remedy: null };
+    }
+    // PIXELS first, not the DOM. The placeholder is painted into the video
+    // surface: a live console showing "No Signal" has that phrase nowhere in
+    // the document or any shadow root (verified live), so a text search can
+    // never see it. A flat CSS-green fill over most of the console region is
+    // the signature, and it costs a strided pixel scan.
+    const green = noSignalGreenFraction(png);
+    if (green < NO_SIGNAL_GREEN_THRESHOLD) {
+      return { blanked: false, kind: null, reason: null, remedy: null };
+    }
+    // Only now spend OCR (~1s), and only once per distinct green screen: the
+    // REASON line is the part that decides the remedy, and it too is pixels.
+    const hash = crypto.createHash('sha1').update(buf!).digest('hex');
+    const cached = this.noSignalCache.get(hash);
+    if (cached) {
+      return cached;
+    }
+    const text = await this.frameOcr.textOfBuffer(buf!).catch(() => null);
+    const state = classifyNoSignal(text, { blanked: true });
+    if (this.noSignalCache.size > 32) {
+      this.noSignalCache.clear();
+    }
+    this.noSignalCache.set(hash, state);
+    return state;
+  }
+  /** Classified green screens, keyed by frame hash — a blanked console repeats. */
+  private noSignalCache = new Map<string, NoSignalState>();
 
   /**
    * Wake a console that is asleep from user inactivity. Sends a bare modifier
@@ -1275,7 +1350,7 @@ export class BrowserService {
    */
   async launchVkvm(
     server: { moid: string; objectType: string; name?: string },
-    opts?: { forceNew?: boolean; skipAutoRecord?: boolean }
+    opts?: { forceNew?: boolean; skipAutoRecord?: boolean; recording?: RecorderOptions }
   ): Promise<any> {
     if (!this.context) {
       throw new Error('Browser is not open. Call browser_open first.');
@@ -1301,6 +1376,7 @@ export class BrowserService {
       if (!opts?.forceNew && !(await this.isConsoleEnded(existing))) {
         // Reuse the live session instead of launching a born-dead duplicate.
         await existing.bringToFront().catch(() => {});
+        const liveRecorder = this.recorders.get(server.moid);
         return {
           server: result.server,
           reused: true,
@@ -1308,6 +1384,18 @@ export class BrowserService {
           pageTitle: await existing.title().catch(() => ''),
           videoSurface:
             'Reused the already-open live vKVM session for this server (a server allows only one live tunneled session). Pass forceNew:true to force a fresh session.',
+          ...(liveRecorder
+            ? { recording: { started: true, reused: true, retentionMinutes: liveRecorder.status().retentionMinutes } }
+            : {}),
+          // Say so rather than no-op silently: the recorder belongs to the
+          // session that is being reused, and changing its settings would mean
+          // restarting it, which clears the frames already captured.
+          ...(opts?.recording
+            ? {
+                recordingOptionsIgnored:
+                  'The existing session and its recorder were reused, so the recording options you passed were NOT applied. To change them, call vkvm_record_stop then vkvm_record_start with the new options — that discards the frames captured so far, so vkvm_export first if you need them.',
+              }
+            : {}),
         };
       }
       // Dead session, or forceNew requested: close it and let the server free
@@ -1432,16 +1520,40 @@ export class BrowserService {
       try {
         this.recorders.get(server.moid)?.stop();
         this.recorders.delete(server.moid);
-        const rec = this.startRecording(server.moid);
+        // Options come through from launch_vkvm_session: getting a longer
+        // retention used to require knowing to stop and restart the recorder,
+        // which is how a 10-hour campaign ended up on the 4-hour default.
+        const rec = this.startRecording(server.moid, opts?.recording);
         result.recording = {
           started: true,
           intervalMs: rec.intervalMs,
           retentionMinutes: rec.retentionMinutes,
-          note: 'Console is being recorded continuously. Use vkvm_recent to see the last frames, vkvm_timeline for a cheap text history, and vkvm_frames_at to inspect a specific moment.',
+          note: `Console is being recorded continuously, keeping ${rec.retentionMinutes} minutes of frames. For a run longer than that pass recording:{retentionMinutes:N} here, or frames will be silently evicted.`,
         };
       } catch (error) {
         result.recording = { started: false, error: (error as Error).message };
       }
+      // The launch response is the one message every operator reads, so the
+      // monitoring path goes here: a field report showed an operator hand-rolling
+      // workarounds for three tools that already existed, having never found them.
+      result.howToMonitor = {
+        cheapFirst:
+          'vkvm_timeline (text only, no image tokens) -> vkvm_find_text (OCR search for "ERROR|FAILED|press any key") -> vkvm_recent (images, only once you know something happened)',
+        input: 'browser_send_keys / browser_mouse for single actions; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST)',
+        waiting: 'vkvm_wait {mode:"stable", untilText:"login:"} to sleep through healthy phases; vkvm_watch for a bounded window',
+        rediscover: 'vkvm_record_status with NO serverMoid lists every recorder, e.g. after losing track of what you launched',
+        // Every tool here is PULL: you find out when you next ask. On a long run
+        // that means checking on your own timer and learning about a wedged
+        // installer at the next tick rather than when it wedged.
+        beNotifiedInsteadOfPolling: {
+          stateFile: `${path.join(this.recordingDir, server.moid, 'state.json')} — this recorder republishes its status there on every stored frame and every event (state, consoleLive, novelty.lastNoveltyAt, ocr.lastTextChangeAt, noSignal, wakes, recoveries, framesEvicted). Readable from any process, including while this MCP server is busy.`,
+          ifYourHarnessCanRunBackgroundCommands:
+            'Launch a shell command in the background that polls that file and EXITS when your condition is met, then let your harness notify you when it exits. That converts pull into push: you are woken when something happens instead of asking repeatedly. Example wedge condition: novelty.lastNoveltyAt AND ocr.lastTextChangeAt both older than 20 minutes.',
+          ifNot: 'Fall back to vkvm_timeline / vkvm_find_text on your own schedule, and keep the interval short enough that a stalled install is caught in time.',
+          caveat:
+            'novelty.lastNoveltyAt already ignores cursor blink and clock/spinner repaints (changes are classified per screen region, not measured in pixels), so it is safe to treat as "when the machine last did something". For a wedge verdict still cross-check ocr.lastTextChangeAt: text is the strongest evidence either way.',
+        },
+      };
     }
     return result;
   }
@@ -1523,21 +1635,13 @@ export class BrowserService {
    * forward keys unless its shadow root sets delegatesFocus, so we reach into
    * the shadow DOM for a genuinely focusable element (canvas/video/[tabindex]).
    */
-  private async focusConsole(page: Page): Promise<void> {
-    await page
-      .evaluate(
-        `(() => {
-          const host = document.querySelector('kvm-ui') || document.querySelector('canvas');
-          if (!host) return false;
-          try { host.setAttribute && host.setAttribute('tabindex', '-1'); } catch (e) {}
-          const root = host.shadowRoot;
-          const inner = root && root.querySelector('canvas, video, [tabindex], input, textarea');
-          const target = inner || host;
-          if (target && target.focus) target.focus();
-          return true;
-        })()`
-      )
-      .catch(() => {});
+  private async focusConsole(page: Page): Promise<ConsoleFocusResult> {
+    // The traversal lives in a tested module and is serialised into the page,
+    // rather than being an inline string nobody could exercise. The previous
+    // inline version could not cross a nested shadow boundary and quietly
+    // focused a header div, so every keystroke was dispatched into the chrome.
+    const result = (await page.evaluate(consoleFocusPageScript()).catch(() => null)) as ConsoleFocusResult | null;
+    return result ?? { focused: false, target: null, isConsoleCanvas: false };
   }
 
   /** Grab a raw PNG screenshot buffer of a (foregrounded) page. */
@@ -1700,12 +1804,18 @@ export class BrowserService {
         }
       }
     }
+    // A green placeholder is not the machine's state. Say so explicitly, so a
+    // screensaver or a powered-off server is never reasoned about as though it
+    // were what the server is doing.
+    const noSignal = await this.consoleNoSignal(page, opts.fullPage ? undefined : buffer);
     return {
       path: filePath,
       base64: buffer.toString('base64'),
       url: page.url(),
       changeSinceLastShot,
       ...(missedChanges ? { missedChanges } : {}),
+      ...(noSignal.blanked ? { noSignal } : {}),
+      ...this.describeTarget(page, opts.serverMoid),
     };
   }
 
@@ -1827,7 +1937,9 @@ export class BrowserService {
     await page.bringToFront().catch(() => {});
     await this.focusConsole(page);
 
-    const keys = opts.keys;
+    // Same normalisation as browser_send_keys: "C" or "Shift+C" must become
+    // Shift+c or the console receives the base key (or nothing).
+    const keys = opts.keys.map(normalizeKeyCombo);
     const stopOn = opts.stopOn ?? 'change';
     let presses = 0;
 
@@ -1924,19 +2036,163 @@ export class BrowserService {
    * one and accept Playwright key names and combos ("Enter", "F6",
    * "Control+Alt+Delete").
    */
-  async sendKeys(opts: { serverMoid?: string; text?: string; keys?: string[] }): Promise<any> {
+  async sendKeys(opts: {
+    serverMoid?: string;
+    text?: string;
+    keys?: string[];
+    verifyMs?: number;
+  }): Promise<any> {
     const page = this.resolvePage(opts.serverMoid);
+    const target = this.describeTarget(page, opts.serverMoid);
+    // 0 disables the check for callers deliberately sending blind input (a key
+    // that is not expected to draw anything, e.g. a modifier).
+    const verifyMs = opts.verifyMs ?? 1500;
     return this.withAgentInput(page, async () => {
       await page.bringToFront().catch(() => {});
-      await this.focusConsole(page);
+      const focus = await this.focusConsole(page);
+      const before = verifyMs > 0 ? await page.screenshot().catch(() => null) : null;
+
+      // NOT keyboard.type(): the console forwards input to the BMC as HID
+      // scancode + modifier byte, deriving the modifier byte from REAL Shift
+      // keydown/keyup events — which type() never emits, so every shifted
+      // character arrived as its base key ("Cisco123!" landed as "cisco1231",
+      // field-verified). Explicit Shift+<base> presses replay what a human's
+      // keyboard actually sends.
       if (opts.text) {
-        await page.keyboard.type(opts.text, { delay: 25 });
+        for (const spec of pressSpecsForText(opts.text)) {
+          await page.keyboard.press(spec, { delay: 12 });
+          // Small inter-key gap: BMCs drop keystrokes delivered back-to-back.
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
       }
       for (const key of opts.keys ?? []) {
-        await page.keyboard.press(key);
+        await page.keyboard.press(normalizeKeyCombo(key), { delay: 12 });
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      return { sent: { text: opts.text ?? null, keys: opts.keys ?? [] }, url: page.url() };
+
+      // Did anything actually happen? "sent" only means Playwright dispatched
+      // the event; it says nothing about whether the BMC received it. A live
+      // session whose input channel had quietly died reported success for every
+      // keystroke while the screen never moved, which took hours to diagnose.
+      const delivery = before ? await this.awaitEcho(page, before, verifyMs) : null;
+      const noSignal = await this.consoleNoSignal(page, delivery?.finalFrame ?? before ?? undefined);
+
+      return {
+        sent: { text: opts.text ?? null, keys: opts.keys ?? [] },
+        ...target,
+        // Names the element, because "consoleFocused: true" about the wrong
+        // element is exactly what hid keys being dispatched into page chrome.
+        consoleFocused: focus.focused && focus.isConsoleCanvas,
+        focusedElement: focus.target,
+        ...(focus.focused && !focus.isConsoleCanvas
+          ? {
+              focusWarning: `Focused "${focus.target}" rather than the console canvas — the client listens for keys on canvas#kvmCanvas, so input sent now is likely to be dropped.`,
+            }
+          : {}),
+        ...(!focus.focused
+          ? {
+              focusWarning:
+                'Could not focus the console canvas at all; keyboard input will not reach the server. Relaunch with launch_vkvm_session forceNew:true.',
+            }
+          : {}),
+        ...(delivery
+          ? {
+              // finalFrame is an internal Buffer - never serialize it into the
+              // response, which is JSON handed to a model.
+              echo: {
+                changed: delivery.changed,
+                changeRatio: delivery.changeRatio,
+                withinMs: delivery.withinMs,
+                afterMs: delivery.afterMs,
+              },
+              ...(delivery.changed
+                ? {}
+                : {
+                    warning:
+                      `The console did not change within ${verifyMs}ms of this input. It may not have been ` +
+                      `delivered. Checks, cheapest first: consoleFocused above; noSignal below; retry with ` +
+                      `vkvm_press_until (repeats the key and reports when the screen reacts); then relaunch ` +
+                      `the session with launch_vkvm_session forceNew:true, which rebuilds the input channel. ` +
+                      `Note some input legitimately draws nothing (a modifier, a key an idle prompt ignores).`,
+                  }),
+            }
+          : {}),
+        ...(noSignal.blanked ? { noSignal } : {}),
+        url: page.url(),
+      };
     });
+  }
+
+  /**
+   * Watch for the console to react to input we just sent, and report what we
+   * saw. Best-effort by construction: a pixel change proves delivery, while no
+   * change is only evidence, not proof (a modifier key draws nothing).
+   */
+  private async awaitEcho(
+    page: Page,
+    before: Buffer,
+    withinMs: number
+  ): Promise<{
+    changed: boolean;
+    changeRatio: number;
+    withinMs: number;
+    afterMs: number;
+    finalFrame?: Buffer;
+  }> {
+    const started = Date.now();
+    const baseline = this.decodePng(before);
+    let best = 0;
+    let last: Buffer | undefined;
+    while (Date.now() - started < withinMs) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const shot = await page.screenshot().catch(() => null);
+      if (!shot) {
+        continue;
+      }
+      last = shot;
+      const ratio = this.diffParsed(baseline, this.decodePng(shot));
+      if (ratio > best) {
+        best = ratio;
+      }
+      // ANY pixel difference is proof the far end reacted - these are
+      // deterministic canvas captures, not camera frames, so there is no noise
+      // floor to filter. A magnitude threshold here declared password entry
+      // undelivered three times running: ten masked-field dots measure ~0.0004,
+      // which sat just under the old 0.0005 cutoff.
+      if (best > 0) {
+        break;
+      }
+    }
+    return {
+      changed: best > 0,
+      changeRatio: this.round4(best),
+      withinMs,
+      afterMs: Date.now() - started,
+      // Reused by the caller so the no-signal check costs no extra screenshot.
+      finalFrame: last,
+    };
+  }
+
+  /**
+   * Name the console a call actually landed on. With several sessions open, the
+   * "most recently opened tab" default silently targets the wrong server - a
+   * real field mistake - so the answer is echoed rather than left implicit in
+   * the returned URL.
+   */
+  private describeTarget(page: Page, requestedMoid?: string): Record<string, unknown> {
+    const moid = this.moidForPage(page);
+    const open = [...this.kvmPages.entries()].filter(([, p]) => !p.isClosed());
+    const name = moid ? this.kvmServers.get(moid)?.name : undefined;
+    const targeted = moid ? { targeted: { serverMoid: moid, ...(name ? { serverName: name } : {}) } } : {};
+    if (requestedMoid || open.length <= 1) {
+      return targeted;
+    }
+    return {
+      ...targeted,
+      targetWarning:
+        `No serverMoid was given and ${open.length} vKVM sessions are open, so this defaulted to the ` +
+        `most recently opened one${name ? ` (${name})` : ''}. Pass serverMoid to be sure.`,
+    };
   }
 
   /**
@@ -1946,12 +2202,16 @@ export class BrowserService {
    * only for pages that expose a real <canvas> and you want canvas-relative
    * coordinates.
    */
-  async mouse(opts: MouseInput & { serverMoid?: string }): Promise<any> {
+  async mouse(opts: MouseInput & { serverMoid?: string; fromScale?: number }): Promise<any> {
     const page = this.resolvePage(opts.serverMoid);
+    const target = this.describeTarget(page, opts.serverMoid);
     return this.withAgentInput(page, async () => {
       await page.bringToFront().catch(() => {});
-      let x = opts.x;
-      let y = opts.y;
+      // Coordinates read off a downscaled recorded frame are not page pixels.
+      const scaled = fromScaledFrame(opts.x, opts.y, opts.fromScale);
+      let x = scaled.x;
+      let y = scaled.y;
+      const scaleApplied = x !== Math.round(opts.x) || y !== Math.round(opts.y);
       let canvasOffsetApplied = false;
       if (opts.relativeTo === 'canvas') {
         const box = await page.locator('canvas').first().boundingBox().catch(() => null);
@@ -1980,7 +2240,16 @@ export class BrowserService {
         default:
           await page.mouse.click(x, y, { button });
       }
-      return { action: opts.action ?? 'click', x, y, button, canvasOffsetApplied, url: page.url() };
+      return {
+        action: opts.action ?? 'click',
+        x,
+        y,
+        button,
+        canvasOffsetApplied,
+        ...(scaleApplied ? { fromScale: opts.fromScale, requested: { x: opts.x, y: opts.y } } : {}),
+        ...target,
+        url: page.url(),
+      };
     });
   }
 
@@ -2163,6 +2432,8 @@ export class BrowserService {
       isSessionDeadViaApi: () => this.isSessionDeadViaApi(serverMoid),
       // A console asleep from user inactivity needs a KEY, not a relaunch.
       wakeConsole: () => this.wakeConsole(serverMoid),
+      // One shared OCR worker across every recorder, not one each.
+      ocrFrame: (framePath) => this.frameOcr.textOf(framePath),
       // Session timeouts are expected on long runs: re-login and relaunch the
       // console, then hand the new page back so recording continues.
       recover: () => this.recoverConsole(serverMoid),
@@ -2205,10 +2476,182 @@ export class BrowserService {
   recordingStatus(serverMoid?: string): any {
     if (serverMoid) {
       const recorder = this.recorders.get(serverMoid);
-      return recorder ? { serverMoid, ...recorder.status() } : { serverMoid, running: false, reason: 'no recorder' };
+      if (recorder) {
+        return { serverMoid, ...recorder.status() };
+      }
+      // Not ours — but another MCP server process may be recording it, and it
+      // publishes its status next to the frames. Reading that is the difference
+      // between "no recorder" and the truth.
+      const foreign = this.foreignRecorderState(serverMoid);
+      return foreign ?? { serverMoid, running: false, reason: 'no recorder in this process and no state published on disk' };
     }
+    const foreign = this.foreignRecorders();
     return {
       recorders: [...this.recorders.entries()].map(([moid, r]) => ({ serverMoid: moid, ...r.status() })),
+      ...(foreign.length ? { recordersInOtherProcesses: foreign } : {}),
+    };
+  }
+
+  /**
+   * Status published by a recorder living in a DIFFERENT process.
+   *
+   * Recorder state used to be reachable only from the process holding it, so a
+   * second MCP server could see the frames but not the counters — `wakes`,
+   * `recoveries`, whether the console was even live. Each recorder now writes
+   * its status beside its frames, and this reads it.
+   */
+  private foreignRecorderState(serverMoid: string): Record<string, unknown> | null {
+    const dir = path.join(this.recordingDir, serverMoid);
+    const state = readRecorderState(dir);
+    if (!state) {
+      return null;
+    }
+    return {
+      serverMoid,
+      ...state,
+      owner: state.ownedByThisProcess
+        ? 'this process (recorder no longer registered)'
+        : `another MCP server process (pid ${state.pid})`,
+      note: state.stale
+        ? `This status is ${Math.round(state.ageMs / 1000)}s old — its recorder has gone quiet and may have exited. Treat the frames as historical.`
+        : 'Published by a recorder in another process. Read-only from here: vkvm_record_stop and the frame tools need the process that owns it.',
+    };
+  }
+
+  /** Every recording directory with published state but no recorder here. */
+  private foreignRecorders(): Array<Record<string, unknown>> {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.recordingDir);
+    } catch {
+      return [];
+    }
+    const out: Array<Record<string, unknown>> = [];
+    for (const moid of entries) {
+      if (this.recorders.has(moid)) {
+        continue;
+      }
+      const state = this.foreignRecorderState(moid);
+      if (state) {
+        out.push(state);
+        continue;
+      }
+      // No published state at all: frames from before sidecars existed, or a
+      // process that died without writing one. Report the directory itself.
+      const dir = this.describeOrphanDir(moid);
+      if (dir) {
+        out.push(dir);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Frame directories on disk with no recorder in THIS process.
+   *
+   * Reported, never deleted. Retention pruning only happens inside a live
+   * recorder, so a stopped or crashed one leaves its frames forever — but a
+   * second MCP server process shares this directory, and its recordings look
+   * identical to abandoned ones from here. Deleting them automatically would
+   * destroy another session's live evidence, so the operator decides.
+   */
+  private describeOrphanDir(moid: string): Record<string, unknown> | null {
+    const dir = path.join(this.recordingDir, moid);
+    try {
+      if (!fs.statSync(dir).isDirectory()) {
+        return null;
+      }
+      const pngs = fs.readdirSync(dir).filter((f) => f.endsWith('.png'));
+      if (pngs.length === 0) {
+        return null;
+      }
+      let bytes = 0;
+      let newest = 0;
+      for (const f of pngs) {
+        const st = fs.statSync(path.join(dir, f));
+        bytes += st.size;
+        newest = Math.max(newest, st.mtimeMs);
+      }
+      const ageMinutes = Math.round((Date.now() - newest) / 60000);
+      return {
+        serverMoid: moid,
+        dir,
+        frames: pngs.length,
+        diskMB: Math.round((bytes / 1048576) * 10) / 10,
+        newestFrameAgeMinutes: ageMinutes,
+        publishedState: false,
+        note:
+          ageMinutes < 5
+            ? 'STILL BEING WRITTEN, but publishing no status — a recorder in another process predating state files. Do not delete.'
+            : 'No recorder here and not written recently; likely left by a previous session. Nothing prunes it.',
+      };
+    } catch {
+      return null; // unreadable entry: skip rather than fail the whole call
+    }
+  }
+
+  /**
+   * Copy recorded frames out of the ring buffer so they survive it.
+   *
+   * Frame paths are already returned everywhere, but archiving them meant
+   * shelling into the filesystem — and the buffer deletes them on a timer, so
+   * evidence for a long run has to be taken out before it ages away.
+   */
+  exportFrames(opts: {
+    serverMoid: string;
+    destDir: string;
+    from?: string;
+    to?: string;
+    minChangeRatio?: number;
+  }): any {
+    const recorder = this.requireRecorder(opts.serverMoid);
+    const parseTime = (v: string | undefined, fallback: number): number => {
+      if (!v) {
+        return fallback;
+      }
+      const t = /^\d+$/.test(v) ? Number(v) : Date.parse(v);
+      if (!Number.isFinite(t)) {
+        throw new Error(`Unparseable time "${v}" — pass an ISO timestamp or epoch milliseconds`);
+      }
+      return t;
+    };
+    const from = parseTime(opts.from, 0);
+    const to = parseTime(opts.to, Date.now());
+    const minRatio = opts.minChangeRatio ?? 0;
+
+    const frames = recorder
+      .allFrames()
+      .filter((f) => f.at >= from && f.at <= to && (f.reason === 'first' || f.changeRatio >= minRatio));
+
+    fs.mkdirSync(opts.destDir, { recursive: true });
+    const copied: Array<Record<string, unknown>> = [];
+    let bytes = 0;
+    let missing = 0;
+    for (const f of frames) {
+      const stamp = new Date(f.at).toISOString().replace(/[:.]/g, '-');
+      const dest = path.join(opts.destDir, `${stamp}-seq${f.seq}-r${f.changeRatio}.png`);
+      try {
+        fs.copyFileSync(f.path, dest);
+        bytes += f.bytes;
+        copied.push({ seq: f.seq, at: new Date(f.at).toISOString(), changeRatio: f.changeRatio, path: dest });
+      } catch {
+        // Evicted between listing and copying: the buffer does not stand still.
+        missing++;
+      }
+    }
+    return {
+      serverMoid: opts.serverMoid,
+      destDir: opts.destDir,
+      exported: copied.length,
+      diskMB: Math.round((bytes / 1048576) * 10) / 10,
+      ...(missing ? { evictedDuringExport: missing } : {}),
+      window: { from: new Date(from).toISOString(), to: new Date(to).toISOString() },
+      firstFrames: copied.slice(0, 3),
+      lastFrames: copied.slice(-3),
+      note:
+        copied.length === 0
+          ? 'Nothing matched. The retention window may already have dropped these frames — check framesEvicted in vkvm_record_status.'
+          : `Frames are filenamed by timestamp, so they sort chronologically next to other test evidence.`,
     };
   }
 
@@ -2421,9 +2864,10 @@ export class BrowserService {
   }
 
   /**
-   * Close the browser we launched. If we merely ATTACHED to a browser owned by
-   * another MCP server instance, only detach — closing it could kill a live
-   * console session that another agent/window is actively using.
+   * Detach from the shared browser. Never closes it: the browser runs as a
+   * detached OS process precisely so that no MCP instance's lifecycle — exit,
+   * restart, or this call — can kill a console another agent is using. Truly
+   * closing it is a deliberate human action (close the window).
    */
   async close(): Promise<any> {
     this.stopKeepalive();
@@ -2434,24 +2878,45 @@ export class BrowserService {
     if (!this.context) {
       return { closed: false, reason: 'Browser was not open' };
     }
-    if (!this.ownsContext) {
-      // Drop our references without touching the browser or its tabs.
-      this.context = null;
-      this.attachedBrowser = null;
-      this.kvmPages.clear();
-      this.adoptedKvmTabs = [];
-      return {
-        closed: false,
-        detached: true,
-        note: 'This instance was attached to a browser owned by another MCP server instance, so it was left running (closing it could kill a console another agent is using). Detached instead.',
-      };
-    }
-    await this.context.close().catch(() => {});
+    // Drop our references without touching the browser or its tabs.
     this.context = null;
     this.attachedBrowser = null;
-    this.ownsContext = false;
     this.kvmPages.clear();
     this.adoptedKvmTabs = [];
-    return { closed: true, note: 'Login cookies persist in the browser profile and may still be valid on next open.' };
+    return {
+      closed: false,
+      detached: true,
+      note: 'Detached. The browser keeps running (it is shared between MCP instances and owned by none); close its window manually to truly quit it. Login cookies persist in the profile either way.',
+    };
   }
+}
+
+/**
+ * A locally installed Edge or Chrome to spawn as the shared browser.
+ * Preference order matches what launchPersistentContext used: Edge, then Chrome.
+ */
+function findBrowserExecutable(): string | null {
+  const programFiles = [
+    process.env['PROGRAMFILES(X86)'],
+    process.env.PROGRAMFILES,
+    process.env.LOCALAPPDATA,
+  ].filter(Boolean) as string[];
+  const candidates = [
+    ...programFiles.map((root) => path.join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe')),
+    ...programFiles.map((root) => path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe')),
+    // Non-Windows fallbacks, matching the channels Playwright would have tried.
+    '/usr/bin/microsoft-edge',
+    '/usr/bin/google-chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
 }

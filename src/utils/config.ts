@@ -21,6 +21,8 @@
  */
 
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { IntersightConfig } from '../services/intersightApi.js';
 
 export interface MCPServerConfig {
@@ -262,7 +264,13 @@ export interface SsoConfig {
 export function loadSsoConfig(): SsoConfig {
   let fileCreds: Record<string, any> = {};
   let usedFile = false;
-  const credsPath = process.env.INTERSIGHT_SSO_CREDENTIALS_FILE;
+  // A recorder daemon is spawned detached and must not depend on inheriting the
+  // MCP server's environment to be able to log in — a daemon that cannot log in
+  // is a console nobody can see. So the conventional profile location is used
+  // when the variable is absent.
+  const defaultCredsPath = path.join(os.homedir(), '.intersight-mcp', 'sso.json');
+  const credsPath =
+    process.env.INTERSIGHT_SSO_CREDENTIALS_FILE ?? (fs.existsSync(defaultCredsPath) ? defaultCredsPath : undefined);
   if (credsPath) {
     try {
       fileCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));

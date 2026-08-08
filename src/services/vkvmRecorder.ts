@@ -36,13 +36,21 @@ export interface RecordedFrame {
   bytes: number;
   /** Fraction of sampled pixels that differed from the previously stored frame. */
   changeRatio: number;
-  reason: 'first' | 'change' | 'heartbeat';
+  /** 'adopted' = inherited from a previous recorder's files, so its change ratio is unknown. */
+  reason: 'first' | 'change' | 'heartbeat' | 'adopted';
 }
 
 /** A notable non-frame occurrence (console death, recovery), for the timeline. */
 export interface RecorderEvent {
   at: number;
-  kind: 'console-dead' | 'recovering' | 'recovered' | 'recovery-failed' | 'vkvm-reset' | 'stopped';
+  kind:
+    | 'console-dead'
+    | 'recovering'
+    | 'recovered'
+    | 'recovery-failed'
+    | 'vkvm-reset'
+    | 'adopted-frames'
+    | 'stopped';
   detail?: string;
 }
 
@@ -428,20 +436,22 @@ export class VkvmRecorder {
       return;
     }
     fs.mkdirSync(this.dir, { recursive: true });
-    // Clear frames left by a previous session so disk use stays bounded. The
-    // in-memory index must be reset with it, or it would reference files that
-    // were just deleted. (Recovery keeps history via attachPage(), not start().)
-    for (const file of fs.readdirSync(this.dir)) {
-      if (file.endsWith('.png')) {
-        fs.unlinkSync(path.join(this.dir, file));
-      }
-    }
     this.frames = [];
     this.seq = 0;
     this.lastViewedSeq = 0;
     this.lastHash = null;
     this.lastPng = null;
     this.tracker.reset();
+    // ADOPT whatever a previous run left here rather than deleting it. Runs after
+    // the reset above so nothing it establishes gets clobbered.
+    //
+    // Deleting was defensible when the MCP server owned the recorder, but under
+    // per-server daemons it became a data-loss path reachable by a READ: with no
+    // daemon live, searching last night's campaign spawned one, and its first act
+    // was to delete the frames being searched. One recorder per server is
+    // guaranteed by the lock file, so continuing the series is safe — and
+    // retention, not deletion-on-start, is what actually bounds disk.
+    this.adoptExistingFrames();
     this.startedAt = Date.now();
     this.state = 'recording';
     this.needsInitialNudge = true;
@@ -884,6 +894,54 @@ export class VkvmRecorder {
       }
     }
     return total ? differing / total : 0;
+  }
+
+  /**
+   * Take ownership of frames a previous run left on disk.
+   *
+   * Their capture times come from file mtimes (the only record left once the
+   * writing process is gone), which is enough for everything a reader does:
+   * retention, the timeline, `framesAt` and OCR search all work off `at`. Change
+   * ratios are NOT invented — those lived in the previous recorder's memory, and
+   * a fabricated 0 would be indistinguishable from a measured one. `reason:
+   * 'adopted'` says exactly what these are.
+   */
+  private adoptExistingFrames(): void {
+    let files: string[];
+    try {
+      files = fs.readdirSync(this.dir).filter((f) => /^f-\d+\.png$/.test(f));
+    } catch {
+      return;
+    }
+    const adopted: RecordedFrame[] = [];
+    for (const file of files) {
+      const full = path.join(this.dir, file);
+      try {
+        const stat = fs.statSync(full);
+        adopted.push({
+          seq: Number(file.slice(2, -4)),
+          at: stat.mtimeMs,
+          path: full,
+          bytes: stat.size,
+          changeRatio: 0,
+          reason: 'adopted',
+        });
+      } catch {
+        // Vanished between listing and stat: nothing to adopt.
+      }
+    }
+    adopted.sort((a, b) => a.seq - b.seq);
+    this.frames = adopted;
+    // Continue the series, so a new capture can never overwrite an old frame.
+    this.seq = adopted.reduce((max, f) => Math.max(max, f.seq), 0);
+    // lastViewedSeq stays at 0: nobody in this process has looked at these yet,
+    // so they legitimately count as changes the caller has not seen.
+    if (adopted.length > 0) {
+      this.addEvent('adopted-frames', `${adopted.length} frame(s) from a previous recorder in this directory`);
+      // Apply retention immediately: adoption must not become the leak that
+      // deleting-on-start was there to prevent.
+      this.prune();
+    }
   }
 
   private store(buf: Buffer, at: number, changeRatio: number, reason: RecordedFrame['reason']): void {

@@ -32,7 +32,6 @@ import { loadSsoConfig, SsoConfig } from '../utils/config.js';
 import { VkvmRecorder, RecordedFrame, RecorderHooks, RecorderOptions } from './vkvmRecorder.js';
 import { FrameOcr } from './frameOcr.js';
 import { AgentInputTracker } from './agentInputTracker.js';
-import { readRecorderState } from './recorderState.js';
 import {
   classifyNoSignal,
   noSignalGreenFraction,
@@ -1371,7 +1370,13 @@ export class BrowserService {
     const result: any = { server: { Moid: server.moid, ObjectType: server.objectType, Name: server.name } };
 
     // Handle any existing session for THIS server BEFORE opening a new tab.
-    const existing = this.kvmPages.get(server.moid);
+    //
+    // Scanned LIVE from the shared browser, not read from the adoption snapshot
+    // taken when we attached. Tabs opened by another process afterwards were
+    // invisible, so a launch opened a SECOND tab for a server that already had
+    // one — reproduced live, and the reason four tabs accumulated on one server
+    // while its session slot stayed occupied by the first.
+    const existing = this.kvmPages.get(server.moid) ?? this.adoptConsoleTab(server.moid);
     if (existing && !existing.isClosed()) {
       if (!opts?.forceNew && !(await this.isConsoleEnded(existing))) {
         // Reuse the live session instead of launching a born-dead duplicate.
@@ -1497,8 +1502,8 @@ export class BrowserService {
       const others = this.otherOpenKvmCount(server.moid);
       result.hint =
         others > 0
-          ? `The KVM session ended immediately, and ${others} other vKVM tab(s) are open. A server allows only one live tunneled session and an existing one may be blocking this — first close the other session(s) with close_vkvm_session (or browser_close) and launch again; only if it still fails, run reset_tunneled_vkvm.`
-          : 'The KVM session ended immediately (known Intersight bug). Run reset_tunneled_vkvm for this server (disables and re-enables Tunneled vKVM, ~60s), then launch again.';
+          ? `The KVM session ended immediately, and ${others} other vKVM tab(s) are open in this browser. A server allows only one live tunneled session, so one of those may be holding the slot — they belong to other servers' recorders, so they are left alone here.`
+          : 'The KVM session ended immediately (known Intersight bug). The recorder daemon retries and escalates to a Tunneled vKVM reset on its own after a second born-dead launch; reset_tunneled_vkvm by hand is only needed if that escalation is exhausted.';
     }
     result.pageTitle = await page.title().catch(() => '');
 
@@ -2286,6 +2291,177 @@ export class BrowserService {
    * Returns null when the answer is unknown (API error, logged out) so the
    * caller does not mistake "cannot tell" for "dead".
    */
+  /**
+   * The Active vKVM sessions on a server, with the facts needed to judge whose
+   * they are.
+   *
+   * `Session` is the iam.Session that created the kvm.Session — the closest
+   * thing to provenance the API offers, though two agents sharing one browser
+   * share one iam.Session, so it can never be the only input.
+   */
+  async activeKvmSessions(serverMoid: string): Promise<
+    Array<{ moid: string; iamSessionMoid: string | null; userIdOrEmail: string | null; createdAt: number }>
+  > {
+    const resp = await this.sessionApi(
+      'GET',
+      `/api/v1/kvm/Sessions?$filter=Server.Moid eq '${serverMoid}' and Status eq 'Active'` +
+        `&$select=Moid,CreateTime,UserIdOrEmail,Session`
+    );
+    if (!resp.ok || !Array.isArray(resp.body?.Results)) {
+      return [];
+    }
+    return resp.body.Results.map((r: any) => ({
+      moid: String(r.Moid),
+      iamSessionMoid: r.Session?.Moid ? String(r.Session.Moid) : null,
+      userIdOrEmail: r.UserIdOrEmail ? String(r.UserIdOrEmail) : null,
+      createdAt: Date.parse(r.CreateTime ?? '') || 0,
+    }));
+  }
+
+  /** Our browser login's identity, for comparing against a session's provenance. */
+  async currentSessionIdentity(): Promise<{ iamSessionMoid: string | null; userIdOrEmail: string | null } | null> {
+    const resp = await this.sessionApi('GET', '/api/v1/iam/Sessions?$select=Moid,UserIdOrEmail&$top=1');
+    const row = resp.ok ? resp.body?.Results?.[0] : null;
+    if (!row) {
+      return null;
+    }
+    return {
+      iamSessionMoid: row.Moid ? String(row.Moid) : null,
+      userIdOrEmail: row.UserIdOrEmail ? String(row.UserIdOrEmail) : null,
+    };
+  }
+
+  /**
+   * End a vKVM session server-side, freeing the server's only session slot.
+   *
+   * It is a PATCH, not a DELETE: DELETE on kvm.Session returns
+   * 403 "Operation not supported" (verified live), which is why this remedy was
+   * so hard to discover — and why reset_tunneled_vkvm looked like the only
+   * option while never being able to help.
+   */
+  async endKvmSession(sessionMoid: string): Promise<any> {
+    const resp = await this.sessionApi('PATCH', `/api/v1/kvm/Sessions/${sessionMoid}`, { Status: 'Ended' });
+    if (!resp.ok) {
+      throw new Error(`could not end kvm.Session ${sessionMoid}: ${resp.status} ${JSON.stringify(resp.body)?.slice(0, 200)}`);
+    }
+    return { ended: true, sessionMoid, status: resp.body?.Status ?? 'Ended', endTime: resp.body?.EndTime ?? null };
+  }
+
+  /**
+   * Is a console tab for this server open in the SHARED browser right now?
+   *
+   * A live scan, not the adoption snapshot taken at attach: tabs opened by
+   * another process after we attached are otherwise invisible, which made a
+   * launch open a second tab for a server that already had one (reproduced
+   * live, and the cause of four accumulated tabs on one server).
+   */
+  hasOpenConsoleTab(serverMoid: string): boolean {
+    return this.findConsoleTabs(serverMoid).length > 0;
+  }
+
+  /**
+   * Register the newest open console tab for a server as ours to drive.
+   *
+   * Called at launch time so a tab another process opened after we attached is
+   * still found. Extra tabs for the same server are closed: they are leftovers
+   * that hold nothing (only one session can be live) and they accumulate — four
+   * were found on a single server after days of MCP restarts.
+   */
+  private adoptConsoleTab(serverMoid: string): Page | null {
+    const tabs = this.findConsoleTabs(serverMoid);
+    if (tabs.length === 0) {
+      return null;
+    }
+    const keep = tabs[tabs.length - 1];
+    for (const extra of tabs.slice(0, -1)) {
+      void extra.close().catch(() => {});
+    }
+    this.kvmPages.set(serverMoid, keep);
+    if (!this.kvmServers.has(serverMoid)) {
+      try {
+        const url = new URL(keep.url());
+        this.kvmServers.set(serverMoid, {
+          moid: serverMoid,
+          objectType: 'compute.RackUnit',
+          name: url.searchParams.get('selectedServerName') ?? undefined,
+        });
+      } catch {
+        /* keep going: the descriptor is only used for relaunch */
+      }
+    }
+    keep.on('close', () => {
+      if (this.kvmPages.get(serverMoid) === keep) {
+        this.kvmPages.delete(serverMoid);
+      }
+    });
+    return keep;
+  }
+
+  /** Every open console tab for a server, found by scanning the shared browser. */
+  private findConsoleTabs(serverMoid: string): Page[] {
+    if (!this.context) {
+      return [];
+    }
+    const tabs: Page[] = [];
+    for (const page of this.context.pages()) {
+      if (page.isClosed()) {
+        continue;
+      }
+      try {
+        const url = new URL(page.url());
+        if (/\/cisco-vkvm\//i.test(url.pathname) && url.searchParams.get('selectedServerMoid') === serverMoid) {
+          tabs.push(page);
+        }
+      } catch {
+        /* not a URL we care about */
+      }
+    }
+    return tabs;
+  }
+
+  /**
+   * Disable and re-enable Tunneled vKVM using the BROWSER session.
+   *
+   * The recorder daemon needs this to escalate when every relaunched console is
+   * born dead, and it holds no API key — it authenticates with the browser's
+   * cookies like everything else it does. Same two PATCHes and settle time as
+   * the API-key path, without the credential dependency.
+   */
+  async resetTunneledVkvmViaSession(serverMoid: string): Promise<void> {
+    const settings = await this.sessionApi(
+      'GET',
+      `/api/v1/compute/ServerSettings?$filter=Server.Moid eq '${serverMoid}'&$select=Moid`
+    );
+    const settingMoid = settings.ok ? settings.body?.Results?.[0]?.Moid : null;
+    if (!settingMoid) {
+      throw new Error(`no compute.ServerSetting found for server ${serverMoid}`);
+    }
+    for (const state of ['Disable', 'Enable'] as const) {
+      const resp = await this.sessionApi('PATCH', `/api/v1/compute/ServerSettings/${settingMoid}`, {
+        TunneledKvmState: state,
+      });
+      if (!resp.ok) {
+        throw new Error(`Tunneled vKVM ${state} failed: ${resp.status}`);
+      }
+      // Each PATCH spawns an "Update Tunneled vKVM" workflow (~15s).
+      await new Promise((resolve) => setTimeout(resolve, 20000));
+    }
+    // Relaunching the instant Enable completes still yields a dead session; the
+    // KVM service needs settle time (measured).
+    await new Promise((resolve) => setTimeout(resolve, 30000));
+  }
+
+  /** Power state, used to release a console nobody can watch anyway. */
+  async isServerPoweredOn(serverMoid: string): Promise<boolean> {
+    const resp = await this.sessionApi(
+      'GET',
+      `/api/v1/compute/PhysicalSummaries?$filter=Moid eq '${serverMoid}'&$select=OperPowerState`
+    );
+    const state = resp.ok ? resp.body?.Results?.[0]?.OperPowerState : null;
+    // Unknown counts as ON: never release a console on a guess.
+    return typeof state === 'string' ? state.toLowerCase() === 'on' : true;
+  }
+
   private async isSessionDeadViaApi(serverMoid: string): Promise<boolean | null> {
     try {
       const resp = await this.sessionApi(
@@ -2473,121 +2649,23 @@ export class BrowserService {
     return { recording: false, stopped: true, serverMoid, ...recorder.status() };
   }
 
-  recordingStatus(serverMoid?: string): any {
-    if (serverMoid) {
-      const recorder = this.recorders.get(serverMoid);
-      if (recorder) {
-        return { serverMoid, ...recorder.status() };
-      }
-      // Not ours — but another MCP server process may be recording it, and it
-      // publishes its status next to the frames. Reading that is the difference
-      // between "no recorder" and the truth.
-      const foreign = this.foreignRecorderState(serverMoid);
-      return foreign ?? { serverMoid, running: false, reason: 'no recorder in this process and no state published on disk' };
-    }
-    const foreign = this.foreignRecorders();
-    return {
-      recorders: [...this.recorders.entries()].map(([moid, r]) => ({ serverMoid: moid, ...r.status() })),
-      ...(foreign.length ? { recordersInOtherProcesses: foreign } : {}),
-    };
-  }
-
   /**
-   * Status published by a recorder living in a DIFFERENT process.
+   * Status of the recorder running IN THIS PROCESS.
    *
-   * Recorder state used to be reachable only from the process holding it, so a
-   * second MCP server could see the frames but not the counters — `wakes`,
-   * `recoveries`, whether the console was even live. Each recorder now writes
-   * its status beside its frames, and this reads it.
+   * Only a recorder daemon has one: an MCP server owns no consoles and asks
+   * daemons over their control endpoint instead. Cross-process discovery lives
+   * in RecorderClient, which reads the lock and state files beside the frames.
    */
-  private foreignRecorderState(serverMoid: string): Record<string, unknown> | null {
-    const dir = path.join(this.recordingDir, serverMoid);
-    const state = readRecorderState(dir);
-    if (!state) {
-      return null;
-    }
-    return {
-      serverMoid,
-      ...state,
-      owner: state.ownedByThisProcess
-        ? 'this process (recorder no longer registered)'
-        : `another MCP server process (pid ${state.pid})`,
-      note: state.stale
-        ? `This status is ${Math.round(state.ageMs / 1000)}s old — its recorder has gone quiet and may have exited. Treat the frames as historical.`
-        : 'Published by a recorder in another process. Read-only from here: vkvm_record_stop and the frame tools need the process that owns it.',
-    };
-  }
-
-  /** Every recording directory with published state but no recorder here. */
-  private foreignRecorders(): Array<Record<string, unknown>> {
-    let entries: string[];
-    try {
-      entries = fs.readdirSync(this.recordingDir);
-    } catch {
-      return [];
-    }
-    const out: Array<Record<string, unknown>> = [];
-    for (const moid of entries) {
-      if (this.recorders.has(moid)) {
-        continue;
-      }
-      const state = this.foreignRecorderState(moid);
-      if (state) {
-        out.push(state);
-        continue;
-      }
-      // No published state at all: frames from before sidecars existed, or a
-      // process that died without writing one. Report the directory itself.
-      const dir = this.describeOrphanDir(moid);
-      if (dir) {
-        out.push(dir);
-      }
-    }
-    return out;
-  }
-
   /**
-   * Frame directories on disk with no recorder in THIS process.
-   *
-   * Reported, never deleted. Retention pruning only happens inside a live
-   * recorder, so a stopped or crashed one leaves its frames forever — but a
-   * second MCP server process shares this directory, and its recordings look
-   * identical to abandoned ones from here. Deleting them automatically would
-   * destroy another session's live evidence, so the operator decides.
+   * One server's recording status. Listing "all recorders" is no longer a
+   * question for this class: recorders live one-per-process now, and the answer
+   * across the machine comes from RecorderClient reading the lock files.
    */
-  private describeOrphanDir(moid: string): Record<string, unknown> | null {
-    const dir = path.join(this.recordingDir, moid);
-    try {
-      if (!fs.statSync(dir).isDirectory()) {
-        return null;
-      }
-      const pngs = fs.readdirSync(dir).filter((f) => f.endsWith('.png'));
-      if (pngs.length === 0) {
-        return null;
-      }
-      let bytes = 0;
-      let newest = 0;
-      for (const f of pngs) {
-        const st = fs.statSync(path.join(dir, f));
-        bytes += st.size;
-        newest = Math.max(newest, st.mtimeMs);
-      }
-      const ageMinutes = Math.round((Date.now() - newest) / 60000);
-      return {
-        serverMoid: moid,
-        dir,
-        frames: pngs.length,
-        diskMB: Math.round((bytes / 1048576) * 10) / 10,
-        newestFrameAgeMinutes: ageMinutes,
-        publishedState: false,
-        note:
-          ageMinutes < 5
-            ? 'STILL BEING WRITTEN, but publishing no status — a recorder in another process predating state files. Do not delete.'
-            : 'No recorder here and not written recently; likely left by a previous session. Nothing prunes it.',
-      };
-    } catch {
-      return null; // unreadable entry: skip rather than fail the whole call
-    }
+  recordingStatus(serverMoid: string): any {
+    const recorder = this.recorders.get(serverMoid);
+    return recorder
+      ? { serverMoid, ...recorder.status() }
+      : { serverMoid, running: false, reason: 'this process holds no recorder for that server' };
   }
 
   /**

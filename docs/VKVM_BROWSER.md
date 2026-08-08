@@ -23,6 +23,116 @@ Both constraints point at the same solution: a real browser.
 - After login Intersight redirects to a **regional** host (e.g. `us-east-1.intersight.com`) where the session cookies live; the service targets that active regional origin rather than the bare `intersight.com`.
 - Screenshots are saved to `~/.intersight-mcp/screenshots/` and also returned inline as MCP image content, so the model literally sees the console.
 
+## Recorders are their own processes
+
+An MCP server is a short-lived thing. It restarts on every code reload, and every chat or fork gets its own. A console session is the opposite: a provisioning run watched overnight must survive all of that. While the MCP server *owned* the recorders, those two lifetimes were fused, and the consequences were observed live:
+
+- An agent in another window **lost its live console twice** because this MCP server restarted and took the browser with it.
+- After an MCP restart the next launch failed with the session slot still occupied by the previous run's session, and nothing could free it — the recorder that owned it was gone.
+- Nobody could tell *whose* session an existing one was, so the safe action was always "leave it", and orphans accumulated (four dead vKVM tabs piled up on one server).
+
+So the recorder became the durable thing and the MCP server became a thin client:
+
+```
+┌─ MCP server (transient) ─┐        ┌─ MCP server (another window) ─┐
+│      RecorderClient      │        │        RecorderClient         │
+└────────────┬─────────────┘        └───────────────┬───────────────┘
+             │  discover by lock file, act over HTTP/127.0.0.1
+             └──────────────┬───────────────────────┘
+                            ▼
+        ┌─ recorder daemon (one per server, detached) ─┐
+        │  RecorderDaemon: login · session repair ·    │
+        │  capture · OCR · dormancy · input arbitration│
+        └───────────────────┬─────────────────────────┘
+                            ▼
+        detached Chromium (shared, owned by nobody)
+```
+
+- **One daemon per server**, enforced by `recorder.lock` beside that server's frames ([src/recorder/recorderLock.ts](../src/recorder/recorderLock.ts)). It holds the pid and the control port. A lock whose pid is dead is taken over; a lock whose pid is alive turns a second daemon away. A lock is also self-correcting: if nothing answers on its port, the client clears it, because the OS reuses pids and an eternally "live" lock pointing at a dead port would make that server unrecordable forever.
+- **Discovery is by filesystem, not memory** — the same trick Chromium uses with `DevToolsActivePort`. A brand-new MCP process that shares nothing with the old one still finds the running recorder ([src/services/recorderClient.ts](../src/services/recorderClient.ts)).
+- **Nobody owns a recorder.** Any MCP server may attach, so two agents can watch and drive the same console.
+- **Spawning is detached** (`detached: true`, stdio to `daemon.log`), so the daemon outlives the process that started it. Verified live: the spawner exits, the daemon keeps recording.
+- **The evidence is on disk, not in a process.** Frames, `state.json` and `text.jsonl` live beside each other, so a background watcher can poll a recorder's state with no protocol and no dependency on this server. The `vkvm_*` read tools go through the daemon (it holds the frame index and the OCR transcript) and never spawn one — see below.
+
+### Each daemon is the single authority for its server
+
+This is what finally made session repair safe. When two parties could act on one server, ending a "stale" session made someone else's recorder relaunch and escalate to a ~90-second Tunneled vKVM reset. With one authority per server there is nobody left to fight, so the daemon can clean up on startup ([src/recorder/sessionOwnership.ts](../src/recorder/sessionOwnership.ts)):
+
+| What it sees | Verdict |
+|---|---|
+| Session belongs to a different Intersight user | **never touch it** |
+| A live recorder holds it | **share** — attach rather than launch a duplicate |
+| Our login, and a console tab is still open | **reuse** the tab |
+| Our login, no tab, no recorder, older than 15s | **orphan** → end it (`PATCH {"Status":"Ended"}`) |
+| We are not the authority for this server | leave it alone |
+
+`DELETE` on a `kvm.Session` returns `403 Operation not supported`; `PATCH {"Status":"Ended"}` is the working remedy (both verified live). That is why this was so hard to find — and why `reset_tunneled_vkvm` looked like the only option while never being able to help.
+
+Verified live end-to-end: with an `Active` session deliberately left holding a server's only slot and no tab anywhere, a freshly spawned daemon logged
+
+```
+ended orphaned session 6a770f2d…: created by our current browser login, no client tab
+and no live recorder — it is holding the server's only session slot for nobody
+```
+
+and then opened its own console.
+
+### A daemon never claims a console it does not have
+
+`launchVkvm` reports its failures in the **result**, not by throwing: a `Forbidden` page, a session that ends the instant it opens, and a reused tab all come back "successfully". Two of those leave no recorder behind at all (autorecord is skipped for a dead console, and a reused tab keeps only the recorder it already had). So the daemon asserts the outcome instead of assuming it, and reports phase `degraded` with the reason when it has no eyes:
+
+- Forbidden → `degraded`; retrying cannot help, so it eventually gives up.
+- Born-dead session → `degraded`, and after the second consecutive one it resets Tunneled vKVM itself (capped at two — if two did not help, the tunnel is not the problem).
+- Console opened but nothing is recording it → `degraded`; a console nobody captures is not a working recorder.
+- A failed `relaunch` → `degraded`, never a stale `active`: relaunch tears the console down first, so that is the moment a lie is most costly.
+
+While degraded, console **input** is refused with the real reason rather than an opaque "no page", and recorded history still reads normally. `vkvm_record_start` says `recording: false` plus a `consoleProblem` explaining what to fix, instead of promising frames that are not coming.
+
+### A read never starts anything, and a start never deletes anything
+
+Two rules that together closed a data-loss path created by the daemon split. Before them, `vkvm_find_text` on last night's campaign — a question purely about the past — spawned a daemon, which logged in, opened a vKVM session, took the server's only session slot, and started a recorder whose **first act was to delete the frames being searched**.
+
+- **Reads never spawn.** `vkvm_recent`, `vkvm_timeline`, `vkvm_find_text`, `vkvm_frames_at` and `vkvm_export` go to a live daemon or refuse, saying how many frames are on disk and where. Starting a console on a physical server is not something a read gets to decide.
+- **A starting recorder ADOPTS the frames it finds.** Their capture times come from file mtimes and they are labelled `reason: 'adopted'` — change ratios are never invented, because a fabricated `0` would be indistinguishable from a measured one. The sequence continues past the highest existing frame, so nothing is overwritten, and retention prunes them by age exactly as it does live ones (which is what "keep disk use bounded" actually needed — deleting on start was a blunt substitute).
+
+Verified live: a daemon stopped with 12 frames on disk, restarted, reported `framesStored: 12` with all 12 files intact and 12 `adopted` rows on its timeline.
+
+### Lifetimes: the process and the data are separate clocks
+
+Keeping a recorder alive is not free — it holds the server's only session slot and pokes the console with an anti-blank nudge every few minutes. Measured on one idle recorder: **zero novelty for 6.6 hours, 100 MB of frames, 110 nudges** sent to a machine nobody was watching. Frames on disk, by contrast, cost nothing but disk ([src/recorder/lifetimePolicy.ts](../src/recorder/lifetimePolicy.ts)):
+
+| Clock | Default | What happens |
+|---|---|---|
+| No client contact | 6 h | **dormant**: release the console and session, keep every frame; resumes on demand |
+| Powered-off server, quiet | 30 min | dormant early — there is no console to watch |
+| Newest frame older than | 3 days | data expires and the daemon exits (long enough that an overnight run is reviewable next working day) |
+| Cannot open a console | 30 min | give up and exit, unless a client is still asking |
+| Disk over budget | 2 GB | dormant data is dropped; an **active** recorder's frames never are |
+
+Giving up on a console matters more than it sounds: every retry attempts a Cisco ID login, and that path locks the account after three failures. Retries back off (1 min doubling to 15 min), and a client asking for the console retries immediately — an agent watching `vkvm_record_status` while a human clears an MFA prompt is exactly who the daemon is for. `vkvm_keep_alive` pins a recorder awake for a known-long campaign.
+
+### Two agents, one console: input is leased, not queued
+
+Reads are always allowed. Console **input** requires a 30-second lease, and a second client is refused with `409` naming the holder and a retry ETA ([src/recorder/inputLease.ts](../src/recorder/inputLease.ts)):
+
+```
+another client (mcp-31984-a1c) holds the input lease for this console — retry in about 17s
+```
+
+Refusal is deliberate, not queueing: a keystroke delivered 90 seconds late lands on a screen that has changed. The daemon also marks itself **busy** during login, session repair and Tunneled vKVM resets, so input during those windows is refused with what it is doing and how long it should take.
+
+**Stopping is not input, and must never be gated by the lease.** It was, briefly, and the result was the failure this architecture exists to prevent, reached from the other direction: one failed keystroke from another client held the lease for 30 seconds, every `stop` in that window came back `409` — *including a forced one* — and the daemon kept its console and its port, killable only by pid.
+
+What *does* guard stopping is peer etiquette, because nobody owning a recorder cuts both ways — nobody gets to destroy one either. `vkvm_record_stop` / `close_vkvm_session` are refused when a **different** client used the recorder in the last 5 minutes:
+
+```
+another client (mcp-31984-a1c) used this console 12s ago; stopping it would take their
+console away mid-run. Pass force:true to stop it anyway, or just leave it — an unused
+recorder releases the console on its own after 6h.
+```
+
+`force: true` is always available, so a wedged recorder is never un-killable by whoever notices it.
+
 ## Tool flow
 
 ```
@@ -259,7 +369,7 @@ Three changes, in order of how much they help:
 - **`vkvm_record_status` reports `framesEvicted` and `evictionStartedAt`**, with a note once the buffer starts rolling. Silence used to be indistinguishable from "nothing lost yet".
 - **`vkvm_export {serverMoid, destDir, from, to, minChangeRatio}`** copies frames out of the buffer into a directory of your choice, named by timestamp so they sort chronologically beside other test evidence. `minChangeRatio: 0.05` archives just the structural moments. Frames evicted mid-export are counted rather than silently missing.
 
-Listing all recorders also reports **`orphanRecordingDirs`**: frame directories with no recorder in this process. Nothing prunes those, since retention only runs inside a live recorder. They are reported and never deleted automatically — a second MCP server process shares the same directory, and from here its live recordings look identical to abandoned ones, so anything written in the last few minutes is flagged as **still being written**.
+Listing all recorders (`vkvm_record_status` with no `serverMoid`) reports every server that has frames on disk, each labelled **live**, **dormant** (console released, frames kept, resumes on demand) or **historical** (no daemon running). Nothing is ever deleted automatically outside a daemon's own retention and expiry clocks: frames are the evidence, and a directory whose daemon is gone still answers questions.
 
 ### The console text transcript — telling wedged apart from slow
 
@@ -324,7 +434,7 @@ The missing piece was that the waiter could not see the recorder. Recorder state
 
 So each recorder now **publishes its status beside its frames**, at `<recordingDir>/<serverMoid>/state.json`, rewritten on every stored frame and every event (`state`, `consoleLive`, `novelty.lastNoveltyAt`, `ocr.lastTextChangeAt`, `newestFrameAt`, `noSignal`, `wakes`, `recoveries`, `framesEvicted`, …). The frames directory was already the shared medium between processes; the status goes there too. Two things fall out:
 
-- **`vkvm_record_status` reports `recordersInOtherProcesses`**, read from those files — so a second MCP server can finally see what the first one is recording, complete with counters, instead of guessing from file mtimes.
+- **`vkvm_record_status` reports every recorder**, read from those files plus each daemon's lock — so any MCP server sees what all the others are recording, complete with counters, instead of guessing from file mtimes. (Recorders now *always* live in another process, which is what made this indispensable rather than merely useful.)
 - **A background waiter is a trivial poller** with no dependency on this server, no second browser, and no duplicated capture.
 
 Three properties that matter if you build on it:

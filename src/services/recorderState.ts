@@ -22,6 +22,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { writeFileAtomicSync } from '../utils/atomicWrite.js';
 
 /** Written into each recorder's frame directory. */
 export const STATE_FILENAME = 'state.json';
@@ -61,56 +62,12 @@ export interface RecorderStateRead extends Record<string, unknown> {
  */
 export function writeRecorderState(dir: string, state: Record<string, unknown>): boolean {
   const payload = JSON.stringify({ ...state, pid: process.pid, updatedAt: new Date().toISOString() }, null, 2);
-  const target = path.join(dir, STATE_FILENAME);
-  // The pid keeps concurrent writers from fighting over one temp name.
-  const tmp = path.join(dir, `.${STATE_FILENAME}.${process.pid}.tmp`);
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(tmp, payload);
-  } catch {
-    return false;
-  }
-  // Windows will refuse to replace a file another handle has open: a reader
-  // doing readFileSync holds one without FILE_SHARE_DELETE, so a watcher
-  // polling this file at the same cadence the recorder writes it collides
-  // regularly (reproduced: ~1 write in 300 failed). The reader's handle lives
-  // for microseconds, so a short backoff clears it.
-  //
-  // This matters more than a missed update: a state file frozen at an old
-  // `lastNoveltyAt` looks exactly like an idle console, which is precisely what
-  // a stall trigger fires on.
-  for (const waitMs of RENAME_BACKOFF_MS) {
-    try {
-      fs.renameSync(tmp, target);
-      return true;
-    } catch {
-      if (waitMs > 0) {
-        sleepSync(waitMs);
-      }
-    }
-  }
-  try {
-    fs.unlinkSync(tmp);
-  } catch {
-    /* nothing to clean up */
-  }
-  // Publishing must never break recording, so the caller only learns it failed.
-  return false;
-}
-
-/** Immediate retry, then ~31ms of backoff in total. Only paid under contention. */
-const RENAME_BACKOFF_MS = [0, 1, 2, 4, 8, 16];
-
-/**
- * Block this thread briefly. Used only on the contended rename path, where the
- * alternative is a silently frozen state file.
- */
-function sleepSync(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    /* SharedArrayBuffer unavailable: fall through and just retry immediately */
-  }
+  // Retried temp+rename: a watcher polling this file at the cadence the recorder
+  // writes it collides regularly (measured: ~1 write in 300 failed). Publishing
+  // must never break recording, so the caller only learns that it failed - and a
+  // state file frozen at an old `lastNoveltyAt` looks exactly like an idle
+  // console, which is precisely what a stall trigger fires on.
+  return writeFileAtomicSync(path.join(dir, STATE_FILENAME), payload);
 }
 
 /**

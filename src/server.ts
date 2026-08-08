@@ -29,6 +29,25 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { IntersightApiService } from './services/intersightApi.js';
 import { BrowserService } from './services/browserService.js';
+import { RecorderClient } from './services/recorderClient.js';
+
+/**
+ * Printed by launch_vkvm_session, the one response every operator reads.
+ * A field report showed an agent hand-rolling workarounds for three tools it
+ * never discovered, so the monitoring path is stated at the point of entry.
+ */
+const RECORDER_MONITORING_HINTS = {
+  cheapFirst:
+    'vkvm_timeline (text only, no image tokens) -> vkvm_find_text (OCR search for "ERROR|FAILED|press any key") -> vkvm_recent (images, only once you know something happened)',
+  input:
+    'browser_send_keys / browser_mouse for single actions; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST)',
+  waiting: 'vkvm_wait {mode:"stable", untilText:"login:"} to sleep through healthy phases; vkvm_watch for a bounded window',
+  sharing:
+    'This console is held by a recorder daemon that outlives every MCP server. Other agents may attach to the same one; input is serialised by a short lease, and a refusal says who holds it.',
+  lifetime:
+    'An idle recorder goes dormant after 6h and releases the console (frames are kept and it resumes on demand). Call vkvm_keep_alive for a known-long campaign.',
+  rediscover: 'vkvm_record_status with NO serverMoid lists every recorder, live or dormant, across all MCP servers',
+} as const;
 import { loadConfig, loadMCPServerConfig, isToolEnabled, getEnabledTools, MCPServerConfig } from './utils/config.js';
 import { createSecurityHealthCheckReport } from './services/securityHealthCheckAgent.js';
 
@@ -36,6 +55,7 @@ export class IntersightMCPServer {
   private server: Server;
   private apiService: IntersightApiService;
   private browserService: BrowserService | null = null;
+  private recorderClient: RecorderClient | null = null;
   private mcpConfig: MCPServerConfig;
 
   constructor() {
@@ -3751,13 +3771,19 @@ export class IntersightMCPServer {
       },
       {
         name: 'close_vkvm_session',
-        description: 'Close the vKVM client page of a server (ends the console session client-side).',
+        description:
+          'Close a vKVM console: stops the server\'s recorder daemon, ends the session server-side and closes the tab. Same operation as vkvm_record_stop — the console and its recorder are one thing. ' +
+          'Refused if another client used the recorder in the last 5 minutes (it may be another agent\'s eyes); pass force:true to close it anyway.',
         inputSchema: {
           type: 'object',
           properties: {
             serverMoid: {
               type: 'string',
-              description: 'MOID of the server whose vKVM page should be closed',
+              description: 'MOID of the server whose vKVM console should be closed',
+            },
+            force: {
+              type: 'boolean',
+              description: 'Close even if another client has been using this console recently',
             },
           },
           required: ['serverMoid'],
@@ -3948,10 +3974,31 @@ export class IntersightMCPServer {
       },
       {
         name: 'vkvm_record_stop',
-        description: 'Stop the continuous console recording for a server (retained frames stay available until they age out).',
+        description:
+          'Stop the console recorder for a server: the daemon exits, its vKVM session ends and its tab closes (retained frames stay readable until they age out). ' +
+          'Recorders are SHARED — another agent may be watching this console — so this is REFUSED if a different client used the recorder in the last 5 minutes, naming who and when; pass force:true to stop it regardless. Usually you need neither: an unused recorder releases the console by itself after 6 idle hours.',
         inputSchema: {
           type: 'object',
-          properties: { serverMoid: { type: 'string', description: 'MOID of the server' } },
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the server' },
+            force: {
+              type: 'boolean',
+              description: 'Stop even if another client has been using this recorder recently (it loses its console)',
+            },
+          },
+          required: ['serverMoid'],
+        },
+      },
+      {
+        name: 'vkvm_keep_alive',
+        description:
+          'Pin a console recorder awake for a known-long campaign. An idle recorder normally goes DORMANT after 6 hours — it ends the vKVM session and stops nudging the console (frames are kept, and it resumes automatically next time you use it). That is right for a forgotten recorder and wrong for a 10-hour install you are not touching, so call this when you know the run is long. Capped at 72 hours.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the recorded server' },
+            hours: { type: 'number', description: 'Hours to stay awake from now (default 12, max 72)' },
+          },
           required: ['serverMoid'],
         },
       },
@@ -3959,7 +4006,7 @@ export class IntersightMCPServer {
         name: 'vkvm_record_status',
         description:
           'Report recording state: frames stored, disk used, capture errors, recoveries/wakes, retention window, frames EVICTED by the ring buffer, and how many console changes occurred since you last viewed frames. OMIT serverMoid to LIST EVERY ACTIVE RECORDER — use this to rediscover which servers you are recording after losing track (e.g. after context compaction); the returned serverMoid values are what the other vkvm_* tools take. ' +
-          'Also reports recordersInOtherProcesses: recorders owned by a DIFFERENT MCP server process, read from the status each one publishes beside its frames (stale entries are labelled, and a recorder that has gone quiet is never reported as live). Those are read-only from here — stopping them or fetching their frames needs the process that owns them. Each recorder also republishes that status to <recordingDir>/<serverMoid>/state.json on every stored frame and event, so a background command can poll it and notify you instead of you polling this tool.',
+          'Consoles are held by per-server recorder DAEMONS that outlive every MCP server, so this reports recorders started by any agent, not just this one: live, dormant (console released after 6h idle, frames kept, resumes on demand), or historical frames with no daemon running. Each daemon also publishes its status to <recordingDir>/<serverMoid>/state.json on every stored frame and event, so a background command can poll that file and notify you instead of you polling this tool.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -5231,42 +5278,70 @@ export class IntersightMCPServer {
       case 'browser_login':
         return this.getBrowserService().ensureLoggedIn({ force: args.force });
 
+      // --- Console tools: all routed to the per-server recorder daemon -------
+      //
+      // No MCP server owns a console. Each server's console is held by ONE
+      // detached daemon that outlives every MCP process, so an MCP restart (on
+      // every code reload, chat and fork) no longer drops a recording, and two
+      // agents can watch or drive the same machine.
       case 'launch_vkvm_session': {
         const server = await this.resolvePhysicalServer(args.serverMoid);
-        return this.getBrowserService().launchVkvm(server, {
-          forceNew: args.forceNew,
+        const client = this.getRecorderClient();
+        const { spawned, phase, lastError, stillStarting } = await client.ensure(server.moid, {
+          serverName: server.name,
+          objectType: server.objectType,
           recording: args.recording,
         });
+        if (args.forceNew) {
+          await client.call(server.moid, 'relaunch', {});
+        }
+        const status = await client.call(server.moid, 'status', {});
+        // A launch that produced no console must say so here. Reporting success
+        // and letting the caller discover it from a blank screenshot is how an
+        // agent ends up watching a console that was never there.
+        const degraded = phase === 'degraded' || status?.phase === 'degraded';
+        return {
+          server: { Moid: server.moid, ObjectType: server.objectType, Name: server.name },
+          consoleOpen: !degraded,
+          recorder: spawned ? 'started a new recorder daemon for this server' : 'attached to the recorder daemon already running for this server',
+          ...(degraded
+            ? {
+                consoleProblem:
+                  `No console is open: ${lastError ?? status?.lastError ?? 'unknown reason'}. ` +
+                  `The daemon keeps retrying and gives up after 30 minutes if nobody asks for it.`,
+              }
+            : {}),
+          ...(stillStarting
+            ? { note: 'The console was still opening when this returned; poll vkvm_record_status.' }
+            : {}),
+          ...status,
+          howToMonitor: RECORDER_MONITORING_HINTS,
+        };
       }
 
       case 'browser_screenshot': {
-        const shot = await this.getBrowserService().screenshot({
-          serverMoid: args.serverMoid,
+        // Screenshots come from the daemon that holds the console.
+        const shot = await this.getRecorderClient().request(args.serverMoid, 'screenshot', {
           fullPage: args.fullPage,
         });
-        // Everything except the base64 payload, which is already the image part.
-        // This used to hand-pick three fields, silently dropping missedChanges
-        // (and later noSignal) even though the docs said they were reported here.
-        const { base64: _omit, ...details } = shot as Record<string, unknown> & { base64: string };
+        const { base64, ...details } = shot as Record<string, unknown> & { base64: string };
         return {
           __mcpContent: [
-            { type: 'image', data: shot.base64, mimeType: 'image/png' },
+            { type: 'image', data: base64, mimeType: 'image/png' },
             { type: 'text', text: JSON.stringify(details, null, 2) },
           ],
         };
       }
 
       case 'browser_send_keys':
-        return this.getBrowserService().sendKeys({
-          serverMoid: args.serverMoid,
+        return this.getRecorderClient().request(args.serverMoid, 'sendKeys', {
           text: args.text,
           keys: args.keys,
           verifyMs: args.verifyMs,
         });
 
       case 'browser_mouse':
-        return this.getBrowserService().mouse({
-          serverMoid: args.serverMoid,
+        return this.getRecorderClient().request(args.serverMoid, 'mouse', {
           x: args.x,
           y: args.y,
           action: args.action,
@@ -5275,25 +5350,17 @@ export class IntersightMCPServer {
           fromScale: args.fromScale,
         });
 
-      case 'browser_goto':
-        return this.getBrowserService().goto(args.url, args.newPage);
-
-      case 'browser_evaluate':
-        return this.getBrowserService().evaluate(args.script, args.serverMoid);
-
-      case 'browser_intersight_api':
-        return this.getBrowserService().sessionApi(args.method, args.path, args.body);
-
-      case 'vkvm_recent':
-        return this.getBrowserService().getRecentFrames(
-          args.serverMoid,
-          args.count,
-          args.scale,
-          args.changesOnly !== false
-        );
+      case 'vkvm_recent': {
+        const r = await this.getRecorderClient().read(args.serverMoid, 'recent', {
+          count: args.count,
+          scale: args.scale,
+          changesOnly: args.changesOnly,
+        });
+        return r;
+      }
 
       case 'vkvm_frames_at':
-        return this.getBrowserService().getFramesAt(args.serverMoid, {
+        return this.getRecorderClient().read(args.serverMoid, 'framesAt', {
           at: args.at,
           secondsAgo: args.secondsAgo,
           before: args.before,
@@ -5302,10 +5369,13 @@ export class IntersightMCPServer {
         });
 
       case 'vkvm_timeline':
-        return this.getBrowserService().getTimeline(args.serverMoid, args.minutesAgo, args.minChangeRatio);
+        return this.getRecorderClient().read(args.serverMoid, 'timeline', {
+          minutesAgo: args.minutesAgo,
+          minChangeRatio: args.minChangeRatio,
+        });
 
       case 'vkvm_find_text':
-        return this.getBrowserService().findTextInFrames(args.serverMoid, {
+        return this.getRecorderClient().read(args.serverMoid, 'findText', {
           pattern: args.pattern,
           lastN: args.lastN,
           minutesAgo: args.minutesAgo,
@@ -5314,20 +5384,46 @@ export class IntersightMCPServer {
           ignoreCase: args.ignoreCase,
         });
 
-      case 'vkvm_record_start':
-        return this.getBrowserService().startRecording(args.serverMoid, {
-          intervalMs: args.intervalMs,
-          retentionMinutes: args.retentionMinutes,
-          maxFrames: args.maxFrames,
-          heartbeatSeconds: args.heartbeatSeconds,
-          antiBlankSeconds: args.antiBlankSeconds,
-          antiBlankMode: args.antiBlankMode,
-          ocrText: args.ocrText,
+      case 'vkvm_record_start': {
+        const server = await this.resolvePhysicalServer(args.serverMoid);
+        const client = this.getRecorderClient();
+        const { spawned, phase, lastError, stillStarting } = await client.ensure(server.moid, {
+          serverName: server.name,
+          objectType: server.objectType,
+          recording: {
+            intervalMs: args.intervalMs,
+            retentionMinutes: args.retentionMinutes,
+            maxFrames: args.maxFrames,
+            heartbeatSeconds: args.heartbeatSeconds,
+            antiBlankSeconds: args.antiBlankSeconds,
+            antiBlankMode: args.antiBlankMode,
+            ocrText: args.ocrText,
+          },
         });
+        const status = await client.call(server.moid, 'status', {});
+        // Say plainly whether a console actually opened. A daemon that is up but
+        // could not log in keeps retrying, and an agent told "recording" would
+        // otherwise wait for frames that are not coming.
+        const degraded = phase === 'degraded' || status?.phase === 'degraded';
+        return {
+          recording: !degraded,
+          recorder: spawned ? 'started a new recorder daemon' : 'a recorder daemon was already running; attached to it (options apply only to a NEW daemon)',
+          ...(degraded
+            ? {
+                consoleProblem:
+                  `The recorder is running but has NO live console: ${lastError ?? status?.lastError ?? 'unknown reason'}. ` +
+                  `It keeps retrying on its own and gives up after 30 minutes if nobody asks for it; fix the cause, then call this again.`,
+              }
+            : {}),
+          ...(stillStarting
+            ? { note: 'The console was still opening when this returned; poll vkvm_record_status for its phase.' }
+            : {}),
+          ...status,
+        };
+      }
 
       case 'vkvm_export':
-        return this.getBrowserService().exportFrames({
-          serverMoid: args.serverMoid,
+        return this.getRecorderClient().read(args.serverMoid, 'exportFrames', {
           destDir: args.destDir,
           from: args.from,
           to: args.to,
@@ -5335,14 +5431,25 @@ export class IntersightMCPServer {
         });
 
       case 'vkvm_record_stop':
-        return this.getBrowserService().stopRecording(args.serverMoid);
+        return this.getRecorderClient().call(args.serverMoid, 'stop', { force: args.force });
 
-      case 'vkvm_record_status':
-        return this.getBrowserService().recordingStatus(args.serverMoid);
+      case 'vkvm_record_status': {
+        const client = this.getRecorderClient();
+        if (!args.serverMoid) {
+          return { recorders: client.list() };
+        }
+        if (!client.isLive(args.serverMoid)) {
+          const known = client.list().find((r) => r.serverMoid === args.serverMoid);
+          return known ?? { serverMoid: args.serverMoid, live: false, note: 'No recorder daemon and no recorded frames for this server.' };
+        }
+        return client.call(args.serverMoid, 'status', {});
+      }
+
+      case 'vkvm_keep_alive':
+        return this.getRecorderClient().request(args.serverMoid, 'keepAlive', { hours: args.hours });
 
       case 'vkvm_wait': {
-        const r = await this.getBrowserService().waitForFrame({
-          serverMoid: args.serverMoid,
+        const r = await this.getRecorderClient().request(args.serverMoid, 'wait', {
           mode: args.mode,
           timeoutMs: args.timeoutMs,
           intervalMs: args.intervalMs,
@@ -5351,18 +5458,19 @@ export class IntersightMCPServer {
           untilText: args.untilText,
           differentFromPath: args.differentFromPath,
         });
-        const { base64, ...meta } = r;
-        return {
-          __mcpContent: [
-            { type: 'image', data: base64, mimeType: 'image/png' },
-            { type: 'text', text: JSON.stringify(meta, null, 2) },
-          ],
-        };
+        const { base64, ...details } = r as Record<string, unknown> & { base64?: string };
+        return base64
+          ? {
+              __mcpContent: [
+                { type: 'image', data: base64, mimeType: 'image/png' },
+                { type: 'text', text: JSON.stringify(details, null, 2) },
+              ],
+            }
+          : r;
       }
 
       case 'vkvm_press_until': {
-        const r = await this.getBrowserService().pressUntil({
-          serverMoid: args.serverMoid,
+        const r = await this.getRecorderClient().request(args.serverMoid, 'pressUntil', {
           keys: args.keys,
           intervalMs: args.intervalMs,
           timeoutMs: args.timeoutMs,
@@ -5370,36 +5478,41 @@ export class IntersightMCPServer {
           stablePeriodMs: args.stablePeriodMs,
           threshold: args.threshold,
         });
-        const { base64, ...meta } = r;
-        return {
-          __mcpContent: [
-            { type: 'image', data: base64, mimeType: 'image/png' },
-            { type: 'text', text: JSON.stringify(meta, null, 2) },
-          ],
-        };
+        const { base64, ...details } = r as Record<string, unknown> & { base64?: string };
+        return base64
+          ? {
+              __mcpContent: [
+                { type: 'image', data: base64, mimeType: 'image/png' },
+                { type: 'text', text: JSON.stringify(details, null, 2) },
+              ],
+            }
+          : r;
       }
 
       case 'vkvm_watch': {
-        const r = await this.getBrowserService().watch({
-          serverMoid: args.serverMoid,
+        const r = await this.getRecorderClient().request(args.serverMoid, 'watch', {
           durationMs: args.durationMs,
           intervalMs: args.intervalMs,
           threshold: args.threshold,
           saveChangeFrames: args.saveChangeFrames,
         });
-        const { firstBase64, lastBase64, ...meta } = r;
-        return {
-          __mcpContent: [
-            { type: 'text', text: `First frame (t=0) and last frame (t=${r.durationMs}ms):` },
-            { type: 'image', data: firstBase64, mimeType: 'image/png' },
-            { type: 'image', data: lastBase64, mimeType: 'image/png' },
-            { type: 'text', text: JSON.stringify(meta, null, 2) },
-          ],
+        const { firstBase64, lastBase64, ...details } = r as Record<string, unknown> & {
+          firstBase64?: string;
+          lastBase64?: string;
         };
+        const content: any[] = [];
+        if (firstBase64) {
+          content.push({ type: 'image', data: firstBase64, mimeType: 'image/png' });
+        }
+        if (lastBase64) {
+          content.push({ type: 'image', data: lastBase64, mimeType: 'image/png' });
+        }
+        content.push({ type: 'text', text: JSON.stringify(details, null, 2) });
+        return { __mcpContent: content };
       }
 
       case 'close_vkvm_session':
-        return this.getBrowserService().closeKvm(args.serverMoid);
+        return this.getRecorderClient().call(args.serverMoid, 'stop', { force: args.force });
 
       case 'reset_tunneled_vkvm':
         return this.resetTunneledVkvm(args.serverMoid);
@@ -5412,6 +5525,23 @@ export class IntersightMCPServer {
     }
   }
 
+  /**
+   * Talks to the per-server recorder daemons. Console work goes through these:
+   * this process owns no console, so nothing it does — including exiting — can
+   * interrupt a recording or another agent's session.
+   */
+  private getRecorderClient(): RecorderClient {
+    if (!this.recorderClient) {
+      this.recorderClient = new RecorderClient(loadConfig().baseUrl);
+    }
+    return this.recorderClient;
+  }
+
+  /**
+   * A BrowserService for GENERAL browser work only (login checks, session-authed
+   * API calls, goto/evaluate). It deliberately never launches or records a
+   * console: that authority belongs to the daemons.
+   */
   private getBrowserService(): BrowserService {
     if (!this.browserService) {
       this.browserService = new BrowserService(loadConfig().baseUrl);

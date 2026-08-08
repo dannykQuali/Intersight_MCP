@@ -57,7 +57,7 @@ Each test file opens with the live failure it exists to prevent:
 | [recorderDaemonConsole.test.ts](../test/recorderDaemonConsole.test.ts) | A daemon reporting phase `active` while sitting on a Forbidden page, an already-ended session, or a reused tab that nothing is recording |
 | [recorderSharing.test.ts](../test/recorderSharing.test.ts) | One agent stopping a recorder another agent is watching; a recorder that cannot be stopped at all because a peer holds the input lease; and a live recorder advertised as dormant by a marker left behind by an earlier run |
 | [recorderDaemonExit.test.ts](../test/recorderDaemonExit.test.ts) | A daemon that releases its console, logs its shutdown, and then never exits — a recorder killable only by pid |
-| [recorderFrameAdoption.test.ts](../test/recorderFrameAdoption.test.ts) | A starting recorder deleting the frames a caller had just asked to search — reachable from a READ once recorders became daemons |
+| [recorderFrameAdoption.test.ts](../test/recorderFrameAdoption.test.ts) | A starting recorder deleting the frames a caller had just asked to search — reachable from a READ once recorders became daemons; and the sequel, adopting 56 frames of history and evicting them at once against the new session's retention window |
 | [atomicWrite.test.ts](../test/atomicWrite.test.ts) | Windows `EPERM` on rename (~1 in 100) silently losing a state publish or a lock write — the latter showing up as a daemon that randomly refuses to start |
 
 All of them were confirmed to **fail against the pre-fix code** before the fixes landed — a test that has never been red is not yet known to test anything.

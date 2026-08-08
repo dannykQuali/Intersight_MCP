@@ -8,8 +8,15 @@
  * `vkvm_find_text` on last night's campaign spawned one, whose recorder started
  * by deleting exactly the frames the caller had asked to search. The lock file
  * already guarantees one recorder per server, so continuing the existing series
- * is safe — and retention still bounds disk by age, which is what "keep disk use
- * bounded" actually needed.
+ * is safe.
+ *
+ * Adoption then had to be gentler than the first attempt. It pruned on adopt, and
+ * a field report caught the result: 56 frames inherited and immediately evicted
+ * against the new session's retention window — "attaching can silently destroy
+ * the history you attached to inspect". Inherited frames are now exempt from the
+ * AGE clock (retention bounds a capture that keeps growing; a finite inherited
+ * set is the only record of what the box did before anyone was watching) and are
+ * bounded by the frame cap instead, which reports separately when it takes them.
  */
 import { strict as assert } from 'node:assert';
 import { afterEach, describe, it } from 'node:test';
@@ -112,11 +119,15 @@ describe('a recorder starting in a directory that already has frames', () => {
     assert.ok(newest.seq > 3, `the new frame must take a fresh sequence number, got ${newest.seq}`);
   });
 
-  it('still prunes adopted frames that are older than retention', async () => {
-    // Adoption must not become a leak: the reason frames were deleted on start
-    // was to bound disk, and retention is what actually does that.
+  it('keeps adopted frames that predate the new retention window', async () => {
+    // The first version of this pruned them, and a field report caught it: an
+    // agent attached to a console, adopted 56 frames from the previous run, and
+    // watched them all evicted against the fresh session's 4-hour window. Those
+    // frames are what the box did BEFORE anyone was watching — the most valuable
+    // evidence in the directory, and irreplaceable. Retention exists to bound a
+    // rolling capture that keeps growing; an inherited set does not grow.
     const dir = tempDir();
-    plantFrames(dir, 3, 600); // 10 hours old
+    plantFrames(dir, 3, 600); // 10 hours old, against a 60-minute window
     const recorder = new VkvmRecorder(new FakeConsolePage(movingMarkFrame(1)) as never, dir, {
       intervalMs: 50,
       retentionMinutes: 60,
@@ -128,13 +139,72 @@ describe('a recorder starting in a directory that already has frames', () => {
     recorders.push(recorder);
     recorder.start();
 
-    await waitFor(() => recorder.status().framesStored >= 1, 3000, 'the first live frame');
+    await waitFor(() => recorder.status().framesStored >= 4, 3000, 'a live frame on top of the adopted ones');
     assert.equal(
       fs.existsSync(path.join(dir, 'f-000001.png')),
-      false,
-      'a frame past the retention window must still be evicted'
+      true,
+      'inherited history must survive the new retention clock'
     );
-    assert.ok(recorder.status().framesEvicted >= 1, 'and the eviction must be reported, not silent');
+    assert.equal(recorder.status().framesEvicted, 0, 'and nothing may be reported as evicted');
+  });
+
+  it('still evicts live frames by age while keeping the adopted ones', async () => {
+    // Adoption must not switch retention off: frames THIS recorder captures are
+    // a rolling window as before.
+    const dir = tempDir();
+    plantFrames(dir, 2, 600);
+    const recorder = new VkvmRecorder(new FakeConsolePage(movingMarkFrame(1)) as never, dir, {
+      // Every captured frame is instantly past a zero-length window.
+      intervalMs: 50,
+      retentionMinutes: 0,
+      heartbeatSeconds: 3600,
+      antiBlankSeconds: 0,
+      antiBlankMode: 'none',
+      ocrText: false,
+    });
+    recorders.push(recorder);
+    recorder.start();
+
+    await waitFor(() => recorder.status().framesEvicted >= 1, 3000, 'a live frame to age out');
+    assert.equal(fs.existsSync(path.join(dir, 'f-000001.png')), true, 'the adopted frames stay');
+    assert.equal(recorder.status().framesStored, 2, 'leaving exactly the inherited history');
+  });
+
+  it('drops adopted frames when the frame cap is reached, oldest first, and says so', async () => {
+    // The safety valve: exemption from the age clock cannot mean unbounded disk,
+    // because repeated restarts keep converting live frames into inherited ones.
+    const dir = tempDir();
+    plantFrames(dir, 5, 600);
+    const recorder = new VkvmRecorder(new FakeConsolePage(movingMarkFrame(1)) as never, dir, {
+      intervalMs: 50,
+      retentionMinutes: 240,
+      maxFrames: 3,
+      heartbeatSeconds: 3600,
+      antiBlankSeconds: 0,
+      antiBlankMode: 'none',
+      ocrText: false,
+    });
+    recorders.push(recorder);
+    recorder.start();
+
+    const status = recorder.status();
+    assert.equal(status.framesStored, 3, 'the cap must still bound the buffer');
+    assert.equal(fs.existsSync(path.join(dir, 'f-000001.png')), false, 'the oldest goes first');
+    assert.equal(fs.existsSync(path.join(dir, 'f-000005.png')), true, 'the newest inherited frame stays');
+    assert.ok(status.adoptedFramesEvicted >= 2, 'losing inherited evidence must be reported, not silent');
+    assert.match(String(status.adoptionNote), /maxFrames|cap/i);
+  });
+
+  it('reports how much history it inherited, at the moment of attaching', async () => {
+    // The attach response is the one message an operator reads; "you now hold 56
+    // frames from an earlier run" belongs there.
+    const dir = tempDir();
+    plantFrames(dir, 4, 600);
+    const recorder = startRecorder(dir);
+
+    const status = recorder.status();
+    assert.equal(status.framesAdopted, 4);
+    assert.match(String(status.adoptionNote), /previous|earlier|inherited/i);
   });
 
   it('ignores files that are not frames', async () => {

@@ -327,6 +327,8 @@ export class VkvmRecorder {
   private lastViewedSeq = 0;
   /** Frames dropped by the ring buffer, i.e. evidence that no longer exists. */
   private framesEvicted = 0;
+  private framesAdopted = 0;
+  private adoptedFramesEvicted = 0;
   private evictionStartedAt = 0;
 
   // Self-healing state. An unattended overnight run WILL hit the Intersight
@@ -932,14 +934,15 @@ export class VkvmRecorder {
     }
     adopted.sort((a, b) => a.seq - b.seq);
     this.frames = adopted;
+    this.framesAdopted = adopted.length;
     // Continue the series, so a new capture can never overwrite an old frame.
     this.seq = adopted.reduce((max, f) => Math.max(max, f.seq), 0);
     // lastViewedSeq stays at 0: nobody in this process has looked at these yet,
     // so they legitimately count as changes the caller has not seen.
     if (adopted.length > 0) {
       this.addEvent('adopted-frames', `${adopted.length} frame(s) from a previous recorder in this directory`);
-      // Apply retention immediately: adoption must not become the leak that
-      // deleting-on-start was there to prevent.
+      // Only the frame cap can act on them here — never the age clock, which
+      // would delete the inherited history at the moment of attaching.
       this.prune();
     }
   }
@@ -1100,23 +1103,56 @@ export class VkvmRecorder {
     }
   }
 
+  /**
+   * Bound the buffer: age for frames THIS recorder captured, the frame cap for
+   * everything.
+   *
+   * Inherited (`adopted`) frames are deliberately exempt from the age clock. A
+   * field report caught the alternative: an agent attached to a console, adopted
+   * 56 frames from the previous run, and watched every one evicted against the
+   * new session's 4-hour window — destroying the history it had attached to
+   * inspect. Retention exists to bound a capture that keeps GROWING; an inherited
+   * set is finite and is the only record of what the machine did before anyone
+   * was watching.
+   *
+   * The cap is the safety valve, because exemption cannot mean unbounded disk:
+   * every restart converts that run's live frames into inherited ones, so with no
+   * cap a restart loop would grow the exempt set forever.
+   */
   private prune(): void {
     const cutoff = Date.now() - this.opts.retentionMinutes * 60000;
-    while (this.frames.length > 0 && (this.frames.length > this.opts.maxFrames || this.frames[0].at < cutoff)) {
-      const dropped = this.frames.shift()!;
-      // Counted and surfaced: a long campaign silently lost ~60% of its console
-      // evidence to the ring buffer, and the first sign was frames simply not
-      // being there when they were wanted. The buffer starting to roll is worth
-      // knowing about while there is still time to raise retention or export.
-      this.framesEvicted++;
-      if (!this.evictionStartedAt) {
-        this.evictionStartedAt = Date.now();
+    for (let i = 0; i < this.frames.length; ) {
+      const frame = this.frames[i];
+      if (frame.reason !== 'adopted' && frame.at < cutoff) {
+        this.frames.splice(i, 1);
+        this.evictFrame(frame);
+      } else {
+        i++;
       }
-      try {
-        fs.unlinkSync(dropped.path);
-      } catch {
-        // already gone
-      }
+    }
+    while (this.frames.length > this.opts.maxFrames) {
+      this.evictFrame(this.frames.shift()!);
+    }
+  }
+
+  private evictFrame(dropped: RecordedFrame): void {
+    // Counted and surfaced: a long campaign silently lost ~60% of its console
+    // evidence to the ring buffer, and the first sign was frames simply not
+    // being there when they were wanted. The buffer starting to roll is worth
+    // knowing about while there is still time to raise retention or export.
+    this.framesEvicted++;
+    if (dropped.reason === 'adopted') {
+      // Reported separately: losing inherited evidence is the more serious loss,
+      // and it can only happen at the frame cap.
+      this.adoptedFramesEvicted++;
+    }
+    if (!this.evictionStartedAt) {
+      this.evictionStartedAt = Date.now();
+    }
+    try {
+      fs.unlinkSync(dropped.path);
+    } catch {
+      // already gone
     }
   }
 
@@ -1301,13 +1337,32 @@ export class VkvmRecorder {
         transcript: path.join(this.dir, OCR_TEXT_FILENAME),
       },
       framesEvicted: this.framesEvicted,
+      framesAdopted: this.framesAdopted,
+      ...(this.framesAdopted > 0
+        ? {
+            adoptionNote:
+              `${this.framesAdopted} frame(s) were inherited from a previous recorder in this directory ` +
+              `and are kept OUTSIDE the ${this.opts.retentionMinutes}-minute retention window — they are the only ` +
+              `record of what this console did before now, so the age clock does not touch them. ` +
+              (this.adoptedFramesEvicted > 0
+                ? `WARNING: ${this.adoptedFramesEvicted} of them have already been deleted to stay under the ` +
+                  `maxFrames cap (${this.opts.maxFrames}); raise maxFrames or vkvm_export the rest now.`
+                : `They are dropped only if the maxFrames cap (${this.opts.maxFrames}) is reached, oldest first.`),
+          }
+        : {}),
+      ...(this.adoptedFramesEvicted > 0 ? { adoptedFramesEvicted: this.adoptedFramesEvicted } : {}),
       evictionStartedAt: this.evictionStartedAt ? new Date(this.evictionStartedAt).toISOString() : null,
       ...(this.framesEvicted > 0
         ? {
             evictionNote:
-              `The ring buffer is rolling: ${this.framesEvicted} frame(s) older than ` +
-              `${this.opts.retentionMinutes} minutes have been deleted and cannot be recovered. ` +
-              `For a run longer than that, raise retentionMinutes (settable on launch_vkvm_session ` +
+              `The ring buffer is rolling: ${this.framesEvicted} frame(s) have been deleted and cannot be ` +
+              `recovered — ${this.framesEvicted - this.adoptedFramesEvicted} for being older than ` +
+              `${this.opts.retentionMinutes} minutes` +
+              (this.adoptedFramesEvicted > 0
+                ? `, and ${this.adoptedFramesEvicted} INHERITED from a previous recorder, dropped at the ` +
+                  `maxFrames cap (${this.opts.maxFrames}) — that history is irreplaceable, so raise maxFrames`
+                : '') +
+              `. For a run longer than the window, raise retentionMinutes (settable on launch_vkvm_session ` +
               `and vkvm_record_start) or archive frames with vkvm_export.`,
           }
         : {}),

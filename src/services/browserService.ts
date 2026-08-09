@@ -41,6 +41,21 @@ import {
 import { fromScaledFrame } from '../utils/frameCoords.js';
 import { consoleFocusPageScript } from '../utils/consoleFocus.js';
 import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
+import {
+  delayForAttempt,
+  estimateTypingMs,
+  runPasteAttempts,
+  typePaced,
+  KEY_HOLD_MS,
+  PASTE_CHAR_DELAY_MS,
+  type TypingSink,
+} from '../utils/pacedTyping.js';
+import { verifyTypedText } from '../utils/typedTextVerdict.js';
+
+/** Time for the console to finish drawing before its text is read back. */
+const SETTLE_BEFORE_READ_MS = 600;
+/** Time for a line-clear to take effect before retyping. */
+const AFTER_CLEAR_MS = 250;
 
 /** What focusConsole managed to focus, named so a failure is diagnosable. */
 type ConsoleFocusResult = { focused: boolean; target: string | null; isConsoleCanvas: boolean };
@@ -2046,6 +2061,8 @@ export class BrowserService {
     text?: string;
     keys?: string[];
     verifyMs?: number;
+    /** Override the inter-key gap. Larger is safer on a slow BMC. */
+    charDelayMs?: number;
   }): Promise<any> {
     const page = this.resolvePage(opts.serverMoid);
     const target = this.describeTarget(page, opts.serverMoid);
@@ -2064,15 +2081,21 @@ export class BrowserService {
       // field-verified). Explicit Shift+<base> presses replay what a human's
       // keyboard actually sends.
       if (opts.text) {
-        for (const spec of pressSpecsForText(opts.text)) {
-          await page.keyboard.press(spec, { delay: 12 });
-          // Small inter-key gap: BMCs drop keystrokes delivered back-to-back.
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
+        // Paced at human speed. The old 25ms gap (~27 chars/s) outran the HID
+        // pipe: when it stalled with a key down, the guest's auto-repeat filled
+        // the gap and `autoinstall` arrived as `autoiiiiiiiiiiiiiiiiiiiiinstaaaa…ll`
+        // — 62 damaged lines, runs of 20 to 50 characters. For anything longer
+        // than a few characters use vkvm_paste_text, which also reads the line
+        // back and retries.
+        const sink: TypingSink = {
+          press: (spec, holdMs) => page.keyboard.press(spec, { delay: holdMs }),
+          wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        };
+        await typePaced(sink, opts.text, opts.charDelayMs ?? PASTE_CHAR_DELAY_MS);
       }
       for (const key of opts.keys ?? []) {
-        await page.keyboard.press(normalizeKeyCombo(key), { delay: 12 });
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        await page.keyboard.press(normalizeKeyCombo(key), { delay: KEY_HOLD_MS });
+        await new Promise((resolve) => setTimeout(resolve, opts.charDelayMs ?? PASTE_CHAR_DELAY_MS));
       }
 
       // Did anything actually happen? "sent" only means Playwright dispatched
@@ -2124,6 +2147,114 @@ export class BrowserService {
           : {}),
         ...(noSignal.blanked ? { noSignal } : {}),
         url: page.url(),
+      };
+    });
+  }
+
+  /**
+   * Type a line of text into the console and PROVE it arrived intact.
+   *
+   * This exists because raw keystrokes are not reliable at machine speed. Every
+   * key crosses the KVM client's WebSocket as a HID report, and when that pipe
+   * stalls with a key down the guest's own auto-repeat fills the gap: an agent's
+   * `autoinstall` reached an Ubuntu prompt as `autoiiiiiiiiiiiiiiiiiiiiinstaaaa…ll`,
+   * 62 damaged lines with runs of 20 to 50 characters. Measured locally, the
+   * browser was never the bottleneck (down->up gaps p90 16ms even under a
+   * screenshot loop), so the remedy is cadence, verification and retry — not a
+   * faster keyup.
+   *
+   * Three properties make this safer than send_keys for text:
+   *   - it types at human speed, which is what the client is built for;
+   *   - it READS the console back and says whether the line matches, naming
+   *     repeat damage specifically (a different fault from "nothing arrived");
+   *   - it never presses Enter on a line it could not verify, so a mangled
+   *     command cannot be executed. Submitting is the caller's opt-in.
+   */
+  async pasteText(opts: {
+    serverMoid?: string;
+    text: string;
+    /** Press Enter — only ever after the line has been verified. */
+    submit?: boolean;
+    /** Milliseconds between keystrokes. Defaults to a human cadence. */
+    charDelayMs?: number;
+    /** Typing attempts, each slower than the last. */
+    maxAttempts?: number;
+    /** Keys that clear a bad line before retyping. Shell line-editor default. */
+    clearKeys?: string;
+    /** Read the console back and check it. Off means type blind, as send_keys does. */
+    verify?: boolean;
+  }): Promise<any> {
+    const page = this.resolvePage(opts.serverMoid);
+    const target = this.describeTarget(page, opts.serverMoid);
+    const text = opts.text ?? '';
+    const verify = opts.verify !== false;
+    const maxAttempts = Math.max(1, Math.min(opts.maxAttempts ?? 2, 4));
+    const clearKeys = opts.clearKeys ?? 'Control+u';
+
+    return this.withAgentInput(page, async () => {
+      await page.bringToFront().catch(() => {});
+      const focus = await this.focusConsole(page);
+      const sink: TypingSink = {
+        press: (spec, holdMs) => page.keyboard.press(spec, { delay: holdMs }),
+        wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      };
+
+      const run = await runPasteAttempts({
+        text,
+        maxAttempts,
+        baseDelayMs: opts.charDelayMs ?? PASTE_CHAR_DELAY_MS,
+        verify,
+        type: (t, charDelayMs) => typePaced(sink, t, charDelayMs),
+        read: async () => {
+          // Let the console finish drawing before reading it back.
+          await new Promise((resolve) => setTimeout(resolve, SETTLE_BEFORE_READ_MS));
+          const shot = await page.screenshot().catch(() => null);
+          return shot ? await this.frameOcr.textOfBuffer(shot).catch(() => null) : null;
+        },
+        check: verifyTypedText,
+        clear:
+          clearKeys.trim().length > 0
+            ? async () => {
+                // The previous line is still on screen and wrong. Clear it before
+                // retyping, or the retry appends to the damage. An empty clearKeys
+                // is the caller saying "this target has no line editor".
+                await page.keyboard.press(normalizeKeyCombo(clearKeys), { delay: KEY_HOLD_MS }).catch(() => {});
+                await new Promise((resolve) => setTimeout(resolve, AFTER_CLEAR_MS));
+              }
+            : undefined,
+      });
+
+      const ok = run.verified !== false;
+      let submitted = false;
+      if (opts.submit && ok) {
+        await new Promise((resolve) => setTimeout(resolve, delayForAttempt(1, opts.charDelayMs ?? PASTE_CHAR_DELAY_MS)));
+        await page.keyboard.press('Enter', { delay: KEY_HOLD_MS }).catch(() => {});
+        submitted = true;
+      }
+
+      return {
+        ...target,
+        text,
+        attempts: run.attempts,
+        verified: run.verified,
+        submitted,
+        consoleFocused: focus.focused && focus.isConsoleCanvas,
+        focusedElement: focus.target,
+        estimatedTypingMs: estimateTypingMs(text, opts.charDelayMs ?? PASTE_CHAR_DELAY_MS),
+        ...(run.problem ? { problem: run.problem } : {}),
+        ...(run.observed !== null && run.verified === false
+          ? { consoleShows: run.observed.replace(/\s+/g, ' ').trim().slice(-400) }
+          : {}),
+        ...(opts.submit && !ok
+          ? {
+              notSubmitted:
+                'Enter was NOT pressed, because the line could not be verified — an unverified command must never ' +
+                'be executed. Inspect consoleShows, clear the line, and try again with a larger charDelayMs.',
+            }
+          : {}),
+        ...(!verify
+          ? { note: 'Typed without verification, as asked. Nothing here proves the console received it.' }
+          : {}),
       };
     });
   }

@@ -352,6 +352,35 @@ The traversal now lives in [`consoleFocus.ts`](../src/utils/consoleFocus.ts) as 
 
 **Shift must be a real keypress, not a flag.** Once focus was fixed, a second input bug surfaced (field repro): typing `aA!@#1-_=+` delivered `aa1231--==` — every shifted character arrived as its unshifted base key, so `Cisco123!` reached a login prompt as `cisco1231`. The client forwards input to the BMC as USB-HID scancode + modifier byte, and it derives that byte by **tracking physical Shift keydown/keyup events**; Playwright's `keyboard.type()` dispatches characters with a modifier *flag* on the event and never emits a Shift keydown, so the modifier byte stayed 0. Text is therefore typed as explicit `Shift+<base>` presses ([`keyboardText.ts`](../src/utils/keyboardText.ts), pinned by tests on the exact repro strings), replaying what a human keyboard sends. Combos are normalised the same way — `"Shift+C"` (reported to deliver *nothing*) becomes `Shift+c`. Characters no US keystroke can produce are rejected loudly: a BMC receives scancodes, and silently mangling a password is the worst failure available. A small inter-key gap (25ms) is kept because BMCs drop back-to-back keystrokes.
 
+### Typing text: the console is slower than the browser
+
+An agent typed `grep -m3 -riE "nocloud|autoinstall|ds" /var/log/cloud-init.log` and the Ubuntu prompt showed
+
+```
+grep -m3 -riE "nocloud|autoiiiiiiiiiiiiiiiiiiiiinstaaaaaaaaaaaaaaaaaaaaall|dsssssssssssss…
+/vaaaaaaaaaaaaaaaaaaaaar/looooooooooooooooooog/clooooooooooooooooooooud-init.lllllllllog
+```
+
+The recorder's own transcript held **62 such lines, with runs of 20 to 50 identical characters** — a key held for one to two seconds. Enter had already been pressed on some of them.
+
+**Measured before fixing anything.** A throwaway browser typing into a canvas that timestamps every `keydown`/`keyup`, with and without a screenshot loop on the same page:
+
+| | keys | down→up p50 | p90 | max | browser-level repeats |
+|---|---|---|---|---|---|
+| no capture loop | 58 | 15 ms | 16 ms | 31 ms | 0 |
+| with capture loop | 58 | 15 ms | 16 ms | 49 ms | 0 |
+
+So the browser was never the bottleneck, and the plausible-sounding theory — that the recorder's screenshots were delaying the keyup — is simply false. The stall is downstream: every keystroke crosses the KVM client's WebSocket to the BMC as a HID report, and at ~27 characters a second (the old 25 ms gap) that pipe backs up. When it stalls with a key **down**, the guest's own keyboard auto-repeat fills the gap.
+
+The remedy is cadence, verification and retry:
+
+- **`browser_send_keys` now paces text at 100 ms per key** (~10 chars/s, the top of human typing speed — these clients are built for humans). `charDelayMs` overrides it.
+- **`vkvm_paste_text` is the tool for a line of text.** It types at that cadence, then **reads the console back by OCR** and says whether the line matches. On a mismatch it clears the line (`Control+u`) and retypes slower: 100 → 175 → 306 → 400 ms, since the previous cadence has just been disproved.
+- **It distinguishes the two failures**, because they have different remedies: *repeat damage* means the keystrokes arrived and the cadence was too fast, while *nothing on screen* means focus or a dead input channel. The squeeze test tells them apart — collapsing runs of 3+ in both strings makes a mangled line comparable to its intended form, while leaving legitimate doubles (`install`) and deliberate runs (`-----`) alone.
+- **It never presses Enter on a line it could not verify.** A mangled `grep` is harmless; a mangled `dd` is not. `submit: true` means "press Enter *if* it verified", and the response says plainly when it did not.
+
+Verified live end-to-end against a locked Windows console (which echoes nothing, so the failure path is the one exercised): typed at 100 ms, retried at 175 ms, reported `verified: false` with *"the typed text is not on screen … check console focus"*, quoted the screen back as `Press Ctrl+Alt+Delete to unlock`, and left Enter unpressed.
+
 ### Input is verified, not assumed
 
 `browser_send_keys` returning `{"sent": …}` only ever meant *Playwright dispatched the event locally*. On a 7-hour-old session whose input channel had quietly degraded, every keystroke reported success while the screen never moved, and the failure took hours to even localise — video was perfect throughout, so no liveness signal fired.

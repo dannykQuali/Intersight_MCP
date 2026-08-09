@@ -28,6 +28,7 @@ import { ControlServer } from './controlServer.js';
 import { InputArbiter } from './inputLease.js';
 import { acquireServerLock, releaseLock } from './recorderLock.js';
 import { classifySession } from './sessionOwnership.js';
+import { estimateTypingMs, PASTE_CHAR_DELAY_MS } from '../utils/pacedTyping.js';
 import {
   decideLifetime,
   shouldGiveUpDegraded,
@@ -159,6 +160,21 @@ export class RecorderDaemon {
       },
       inputActions: {
         sendKeys: async (p) => this.requireConsole().browser.sendKeys({ ...p, serverMoid: this.opts.serverMoid }),
+        // Typing a whole line takes seconds at a safe cadence, and a verify pass
+        // adds a screenshot plus OCR — so the lease is held with an ETA rather
+        // than leaving a peer to guess why input is refused.
+        pasteText: async (p) => {
+          const text = String(p?.text ?? '');
+          this.arbiter.setBusy(
+            `typing ${text.length} character(s) into the console and reading them back`,
+            estimateTypingMs(text, Number(p?.charDelayMs) || PASTE_CHAR_DELAY_MS) * 2 + 5000
+          );
+          try {
+            return await this.requireConsole().browser.pasteText({ ...p, text, serverMoid: this.opts.serverMoid });
+          } finally {
+            this.arbiter.clearBusy();
+          }
+        },
         mouse: async (p) => this.requireConsole().browser.mouse({ ...p, serverMoid: this.opts.serverMoid }),
         pressUntil: async (p) => this.requireConsole().browser.pressUntil({ ...p, serverMoid: this.opts.serverMoid }),
         wait: async (p) => this.requireConsole().browser.waitForFrame({ ...p, serverMoid: this.opts.serverMoid }),

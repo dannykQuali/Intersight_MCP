@@ -3656,7 +3656,8 @@ export class IntersightMCPServer {
         name: 'browser_send_keys',
         description:
           'Send keyboard input to a browser page (e.g. type into a vKVM console). "text" is typed literally as US-layout keystrokes — uppercase and symbols are delivered with a real held Shift, so passwords like "Cisco123!" arrive intact; characters with no US keystroke (e.g. accented letters) are rejected loudly rather than silently mangled. "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete". ' +
-          'Also VERIFIES delivery: it reports consoleFocused, watches for the console to react, and warns if nothing changed — "sent" alone would only mean the event was dispatched locally, which once masked a session whose input channel had silently died. To catch a prompt that only appears briefly, or to retry until the screen reacts, use vkvm_press_until instead of calling this in a loop.',
+          'Also VERIFIES delivery: it reports consoleFocused, watches for the console to react, and warns if nothing changed — "sent" alone would only mean the event was dispatched locally, which once masked a session whose input channel had silently died. To catch a prompt that only appears briefly, or to retry until the screen reacts, use vkvm_press_until instead of calling this in a loop. ' +
+          'FOR A LINE OF TEXT, PREFER vkvm_paste_text: it reads the line back off the console and retypes it if the guest key-repeat mangled it (an agent typing "autoinstall" once got "autoiiiiiiiiiiiiiiiiiiiiinstaaaa...ll"), and it refuses to press Enter on a line it could not verify. This tool types blind.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3679,7 +3680,50 @@ export class IntersightMCPServer {
               description:
                 'How long to watch for the console to react, in ms (default 1500). Set 0 to skip the check for input that is not expected to draw anything, e.g. a bare modifier.',
             },
+            charDelayMs: {
+              type: 'number',
+              description:
+                'Milliseconds between keystrokes (default 100, about 10 characters a second — the top of human typing speed). Raise it on a slow BMC: typing faster than the console can hand keys to the server makes a held key auto-repeat.',
+            },
           },
+        },
+      },
+      {
+        name: 'vkvm_paste_text',
+        description:
+          'Type a line of text into a server console and PROVE it arrived intact — the reliable way to enter a command, a path, or a password. ' +
+          'Raw keystrokes are not safe at machine speed: every key crosses the KVM client as a HID report, and when that pipe stalls with a key down, the auto-repeat of the guest keyboard fills the gap. Field evidence: "autoinstall" arrived as "autoiiiiiiiiiiiiiiiiiiiiinstaaaaaaaaaaaaaaaaaaaaall", 62 damaged lines with runs of 20-50 characters. ' +
+          'So this types at human speed, then READS THE CONSOLE BACK by OCR and reports whether the line matches — naming key-repeat damage specifically, which is a different fault from "nothing arrived" (that one means focus or a dead input channel). On a mismatch it clears the line (Control+u by default) and retypes more slowly. ' +
+          'It NEVER presses Enter on a line it could not verify, so a mangled command cannot execute; pass submit:true to have Enter sent only after a successful match. Typing a long line takes seconds by design, and the recorder reports a busy state with an ETA while it does.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverMoid: { type: 'string', description: 'MOID of the server whose console to type into' },
+            text: { type: 'string', description: 'The line to type. Newlines are pressed as Enter.' },
+            submit: {
+              type: 'boolean',
+              description: 'Press Enter after the text — but only if verification succeeded (default false)',
+            },
+            charDelayMs: {
+              type: 'number',
+              description: 'Milliseconds between keystrokes (default 100, about 10 characters a second). Each retry is automatically slower: 100 -> 175 -> 306 -> 400.',
+            },
+            maxAttempts: {
+              type: 'number',
+              description: 'Typing attempts before giving up, each slower than the last (default 2, max 4)',
+            },
+            clearKeys: {
+              type: 'string',
+              description:
+                'Keys that clear a bad line before a retry (default "Control+u", the shell line-editor kill). Use "" for a target with no line editor.',
+            },
+            verify: {
+              type: 'boolean',
+              description:
+                'Read the console back and check what landed (default true). false types blind, like browser_send_keys.',
+            },
+          },
+          required: ['serverMoid', 'text'],
         },
       },
       {
@@ -5376,6 +5420,17 @@ export class IntersightMCPServer {
           text: args.text,
           keys: args.keys,
           verifyMs: args.verifyMs,
+          charDelayMs: args.charDelayMs,
+        });
+
+      case 'vkvm_paste_text':
+        return this.getRecorderClient().request(args.serverMoid, 'pasteText', {
+          text: args.text,
+          submit: args.submit,
+          charDelayMs: args.charDelayMs,
+          maxAttempts: args.maxAttempts,
+          clearKeys: args.clearKeys,
+          verify: args.verify,
         });
 
       case 'browser_mouse':

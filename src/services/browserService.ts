@@ -39,6 +39,7 @@ import {
   NO_SIGNAL_GREEN_THRESHOLD,
 } from './consoleSignals.js';
 import { fromScaledFrame } from '../utils/frameCoords.js';
+import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
 import { consoleFocusPageScript } from '../utils/consoleFocus.js';
 import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
 import {
@@ -51,6 +52,19 @@ import {
   type TypingSink,
 } from '../utils/pacedTyping.js';
 import { verifyTypedText } from '../utils/typedTextVerdict.js';
+
+/**
+ * How long to wait for an attach. Generous: Playwright attaches to every page,
+ * and a busy shared browser with a dozen tabs is slow rather than absent — a 5s
+ * timeout here was read as "no browser" and triggered a destructive spawn.
+ */
+const ATTACH_TIMEOUT_MS = 20000;
+
+/** Liveness probe for a published CDP endpoint. Cheap HTTP, no page attach. */
+const ENDPOINT_PROBE_MS = 3000;
+
+/** Attach retries while a browser is known to be running but not yet reachable. */
+const ATTACH_RETRIES = 3;
 
 /** Time for the console to finish drawing before its text is read back. */
 const SETTLE_BEFORE_READ_MS = 600;
@@ -166,23 +180,103 @@ export class BrowserService {
    * be driving someone's live console). The file can also be stale, so a failed
    * connect simply falls through to launching.
    */
-  private async tryAttach(): Promise<BrowserContext | null> {
+  private async tryAttach(timeoutMs = ATTACH_TIMEOUT_MS): Promise<BrowserContext | null> {
     const endpoint = this.devtoolsEndpoint();
     if (!endpoint) {
       return null;
     }
     try {
-      const browser = await chromium.connectOverCDP(endpoint, { timeout: 5000 });
+      const browser = await chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
       const ctx = browser.contexts()[0];
       if (!ctx) {
-        await browser.close().catch(() => {});
+        // NEVER browser.close() here: on a CDP connection that quits the shared
+        // browser, killing every console on it — the one thing this design
+        // promises not to do. Dropping the reference is enough.
         return null;
       }
       this.attachedBrowser = browser;
+      this.watchForDialogs(ctx);
       return ctx;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Keep trying to attach to a browser we KNOW is there.
+   *
+   * A wedged page can stall Playwright's attach for a while and then let go, so
+   * a few patient attempts recover without touching the running browser.
+   */
+  private async retryAttach(): Promise<BrowserContext | null> {
+    for (let i = 0; i < ATTACH_RETRIES; i++) {
+      const ctx = await this.tryAttach(ATTACH_TIMEOUT_MS);
+      if (ctx) {
+        return ctx;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return null;
+  }
+
+  /**
+   * A page it is safe to navigate: never a vKVM console, preferring a blank tab,
+   * and opening a fresh tab when every existing one is a console.
+   */
+  private async pageToNavigate(context: BrowserContext): Promise<Page> {
+    const pages = context.pages();
+    const index = pickNavigablePage(pages.map((p) => p.url()));
+    if (index !== null) {
+      return pages[index];
+    }
+    return context.newPage();
+  }
+
+  /** Does a browser answer on the endpoint the profile published? */
+  private async endpointAnswers(endpoint: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${endpoint}/json/version`, {
+        signal: AbortSignal.timeout(ENDPOINT_PROBE_MS),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Is a browser already holding this profile?
+   *
+   * Chromium keeps a lock file while it owns a user-data-dir. Launching onto a
+   * held profile does not start a browser: the new process hands its URL to the
+   * running one and exits, which is how five stray about:blank tabs accumulated
+   * while every attach failed.
+   */
+  private profileInUse(): boolean {
+    for (const name of ['SingletonLock', 'lockfile', 'SingletonSocket']) {
+      if (fs.existsSync(path.join(this.profileDir, name))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Dismiss any dialog a page raises, so one can never wedge a renderer.
+   *
+   * A `beforeunload` dialog blocks its renderer until a human clicks, and because
+   * Playwright's attach touches every page, ONE such dialog made every attach in
+   * every process fail. Dismissing keeps the page (accepting would discard it),
+   * which is the safe default for a console someone may be using.
+   */
+  private watchForDialogs(context: BrowserContext): void {
+    const attach = (page: Page) => {
+      page.on('dialog', (dialog) => {
+        void dialog.dismiss().catch(() => {});
+      });
+    };
+    context.pages().forEach(attach);
+    context.on('page', attach);
   }
 
   /**
@@ -195,7 +289,7 @@ export class BrowserService {
     for (const page of context.pages()) {
       try {
         const url = new URL(page.url());
-        if (!/\/cisco-vkvm\//i.test(url.pathname)) {
+        if (!isConsoleUrl(url.pathname)) {
           continue;
         }
         const moid = url.searchParams.get('selectedServerMoid');
@@ -255,7 +349,36 @@ export class BrowserService {
     //    died mid-use, twice, each time this server's window was restarted.
     //    A detached OS process is owned by nobody; every instance (including
     //    this one) is just an attacher, and restarts kill nothing.
-    await this.spawnDetachedBrowser(viewport);
+    // A failed attach does NOT mean there is no browser. Ask before spawning:
+    // spawning onto a live profile deleted the running browser's port file and
+    // orphaned it, breaking discovery for every process on the machine.
+    const endpoint = this.devtoolsEndpoint();
+    const decision = decideBrowserAcquisition({
+      endpointFromFile: endpoint,
+      endpointAnswers: endpoint ? await this.endpointAnswers(endpoint) : false,
+      attachFailed: true,
+      profileInUse: this.profileInUse(),
+    });
+
+    if (decision.action === 'retry-attach') {
+      const reattached = await this.retryAttach();
+      if (reattached) {
+        this.context = reattached;
+        this.adoptedKvmTabs = this.adoptExistingKvmTabs(reattached);
+        reattached.on('close', () => {
+          this.context = null;
+          this.kvmPages.clear();
+        });
+        return reattached;
+      }
+      throw new Error(
+        `A browser is already running on this profile but could not be attached to: ${decision.reason}. ` +
+          'A stuck page dialog is the usual cause — dismiss it in the browser window, or close that tab. ' +
+          'Launching a second browser here would orphan the running one, so it is deliberately not attempted.'
+      );
+    }
+
+    await this.spawnDetachedBrowser(viewport, decision.removeStalePortFile);
     const spawned = await this.tryAttach();
     if (!spawned) {
       throw new Error(
@@ -274,7 +397,10 @@ export class BrowserService {
    * Start the shared browser as a detached OS process on our profile, with a
    * CDP port published in DevToolsActivePort, and wait until it is attachable.
    */
-  private async spawnDetachedBrowser(viewport?: { width: number; height: number }): Promise<void> {
+  private async spawnDetachedBrowser(
+    viewport?: { width: number; height: number },
+    removeStalePortFile = false
+  ): Promise<void> {
     const exe = findBrowserExecutable();
     if (!exe) {
       throw new Error(
@@ -282,12 +408,15 @@ export class BrowserService {
       );
     }
     // A stale port file would make the post-spawn attach race against the old
-    // dead port; remove it and wait for the NEW browser to write a fresh one.
-    const portFile = path.join(this.profileDir, 'DevToolsActivePort');
-    try {
-      fs.unlinkSync(portFile);
-    } catch {
-      /* none there */
+    // dead port. Removed ONLY when nothing answers on it — deleting a live
+    // browser's port file orphans it, and that is how discovery stayed broken
+    // for hours while every retry added another blank tab.
+    if (removeStalePortFile) {
+      try {
+        fs.unlinkSync(path.join(this.profileDir, 'DevToolsActivePort'));
+      } catch {
+        /* none there */
+      }
     }
     const size = viewport ?? { width: 1600, height: 900 };
     const child = spawn(
@@ -319,7 +448,11 @@ export class BrowserService {
   /** Open the browser window and navigate to the Intersight login page. */
   async open(url?: string, viewport?: { width: number; height: number }): Promise<any> {
     const context = await this.ensureContext(viewport);
-    const page = context.pages()[0] ?? (await context.newPage());
+    // NEVER pages()[0] blindly: on a shared browser that tab is often a live
+    // vKVM console, and navigating one away raises "Leave site?" — which wedges
+    // that renderer until a human clicks, and if they click Leave it destroys a
+    // console another agent may be mid-installation on. Both happened.
+    const page = await this.pageToNavigate(context);
     const target = url ?? this.origin;
     // Navigate FIRST: on a warm profile this lets a still-valid session redirect
     // to the regional host, so isLoggedIn() can see it and we skip logging in
@@ -419,7 +552,7 @@ export class BrowserService {
     if (!this.isBareOrigin(origin) || !this.context) {
       return origin;
     }
-    const page = this.context.pages()[0] ?? (await this.context.newPage());
+    const page = await this.pageToNavigate(this.context);
     await page
       .goto(`${origin}/an/infrastructure-service/an/compute/physical-summaries`, {
         waitUntil: 'domcontentloaded',

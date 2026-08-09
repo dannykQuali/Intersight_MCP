@@ -23,6 +23,29 @@ Both constraints point at the same solution: a real browser.
 - After login Intersight redirects to a **regional** host (e.g. `us-east-1.intersight.com`) where the session cookies live; the service targets that active regional origin rather than the bare `intersight.com`.
 - Screenshots are saved to `~/.intersight-mcp/screenshots/` and also returned inline as MCP image content, so the model literally sees the console.
 
+## Never orphan the shared browser
+
+One `beforeunload` dialog cost an agent its console and broke browser discovery for every process on the machine. The chain, all of it evidenced from a live incident:
+
+1. Something navigated a **live vKVM tab** away. `open()` reused `context.pages()[0]`, and on a shared browser that tab is often a console — so Chromium raised *"Leave site?"* and **blocked that renderer** until a human clicked.
+2. Playwright's `connectOverCDP` attaches to *every* page, so one wedged page made **every attach, in every process**, hit its 5-second timeout. Raw CDP was fine the whole time: `Browser.getVersion` answered instantly, and each renderer's `Runtime.evaluate` hung — which is how the wedged pages were identified.
+3. A failed attach fell through to "spawn a browser", whose first act was **deleting the profile's `DevToolsActivePort`** — the live browser's own port file, and the only way anyone discovers it.
+4. Edge, launched onto a profile already in use, **handed its `about:blank` to the running browser and exited** without writing a port file. So the spawn threw `Browser started but never published DevToolsActivePort`, and every retry repeated steps 3–4: discovery stayed broken, and one stray blank tab accumulated per attempt (five by the time it was noticed).
+
+The daemon's own `lastError` was that exact string, and the blank-tab count rising 3 → 4 → 5 during diagnosis confirmed the loop was still running.
+
+Four rules now, each with a test:
+
+- **A browser that ANSWERS is present**, however badly it is behaving. `decideBrowserAcquisition` ([browserAcquisition.ts](../src/services/browserAcquisition.ts)) returns `retry-attach`, never `spawn`, when the published endpoint responds — a hung attach is evidence of a browser, not of its absence. Attach also gets 20 s rather than 5, because a busy shared browser with a dozen tabs is slow, not absent.
+- **A port file is never deleted while something is listening on it.** Only a file nobody answers on is stale.
+- **A launch is never attempted onto a profile already in use** (Chromium's `SingletonLock`): it cannot start a browser there, it just donates a tab to the running one.
+- **`open()` never navigates a console tab.** `pickNavigablePage` prefers a blank tab, falls back to any non-console tab, and opens a new one when every tab is a console.
+- **Dialogs are dismissed, not left standing.** Every attached and newly created page gets a `dialog` handler that dismisses (keeping the page — accepting would discard it), so a stray `beforeunload` can never wedge a renderer again.
+
+`browser.close()` on a CDP-attached browser is also gone: it quits the shared browser, killing every console on it.
+
+Recovery, if this ever happens again: the port file can be rewritten by hand from `curl http://127.0.0.1:<port>/json/version` while the browser still listens, and a wedged renderer is found by sending `Runtime.evaluate` to each target in `/json/list` — the one that never replies is the one holding a dialog.
+
 ## Recorders are their own processes
 
 An MCP server is a short-lived thing. It restarts on every code reload, and every chat or fork gets its own. A console session is the opposite: a provisioning run watched overnight must survive all of that. While the MCP server *owned* the recorders, those two lifetimes were fused, and the consequences were observed live:

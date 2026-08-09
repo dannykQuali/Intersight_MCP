@@ -228,6 +228,12 @@ export interface RecorderOptions {
   /** Store a frame at least this often even when nothing changes. Default 60s. */
   heartbeatSeconds?: number;
   /**
+   * Heartbeat cadence while the screen is BYTE-IDENTICAL to the frame already
+   * stored. Backed right off, because such a frame carries nothing the record
+   * does not already hold.
+   */
+  identicalHeartbeatSeconds?: number;
+  /**
    * How often (in capture ticks) to verify the console is still alive rather
    * than showing a dead "KVM session has ended" screen. Default 10 (~10s).
    */
@@ -327,6 +333,9 @@ export class VkvmRecorder {
   private lastViewedSeq = 0;
   /** Frames dropped by the ring buffer, i.e. evidence that no longer exists. */
   private framesEvicted = 0;
+  /** Hash of the most recently STORED frame, distinct from the last sample. */
+  private lastStoredHash: string | null = null;
+  private heartbeatsSuppressed = 0;
   private framesAdopted = 0;
   private adoptedFramesEvicted = 0;
   private evictionStartedAt = 0;
@@ -415,6 +424,7 @@ export class VkvmRecorder {
       retentionMinutes: opts?.retentionMinutes ?? 240,
       maxFrames: opts?.maxFrames ?? 3000,
       heartbeatSeconds: opts?.heartbeatSeconds ?? 60,
+      identicalHeartbeatSeconds: opts?.identicalHeartbeatSeconds ?? 1800,
       deadCheckEveryTicks: Math.max(1, opts?.deadCheckEveryTicks ?? 10),
       apiCheckEveryTicks: Math.max(5, opts?.apiCheckEveryTicks ?? 60),
       antiBlankSeconds: opts?.antiBlankSeconds ?? 240,
@@ -758,7 +768,19 @@ export class VkvmRecorder {
         // through to maybeNudge() rather than returning early.
         this.stillSamples++;
         if (heartbeatDue) {
-          this.store(buf, now, 0, 'heartbeat');
+          // A heartbeat whose image is byte-identical to the stored one adds no
+          // information at all. Six of nine recorded servers were found powered
+          // OFF, their consoles a static green "Host power is off" — and the
+          // minute-by-minute heartbeat had stored that same image 1193 times,
+          // 57MB, each one also queued for OCR. So the cadence backs off rather
+          // than switching off: an occasional anchor still proves capture is
+          // alive and keeps newestFrameAt moving, which the dormancy and
+          // data-expiry clocks are judged on.
+          if (hash === this.lastStoredHash && now - this.lastStoredAt < this.opts.identicalHeartbeatSeconds * 1000) {
+            this.heartbeatsSuppressed++;
+          } else {
+            this.store(buf, now, 0, 'heartbeat');
+          }
         }
       } else {
         // Something repainted. WHERE and WHAT decide whether it matters: the
@@ -964,6 +986,7 @@ export class VkvmRecorder {
       reason,
     });
     this.lastStoredAt = at;
+    this.lastStoredHash = crypto.createHash('sha1').update(buf).digest('hex');
     this.prune();
     this.enqueueOcr(this.frames[this.frames.length - 1]);
     this.publishState();
@@ -1336,6 +1359,16 @@ export class VkvmRecorder {
         failures: this.ocrFailures,
         transcript: path.join(this.dir, OCR_TEXT_FILENAME),
       },
+      heartbeatsSuppressed: this.heartbeatsSuppressed,
+      ...(this.heartbeatsSuppressed > 0
+        ? {
+            heartbeatNote:
+              `${this.heartbeatsSuppressed} heartbeat frame(s) were skipped because the screen was ` +
+              `byte-identical to the frame already stored — a powered-off or parked console is recorded once, ` +
+              `then anchored every ${Math.round(this.opts.identicalHeartbeatSeconds / 60)} minutes instead of every ` +
+              `${this.opts.heartbeatSeconds}s. Any real change is still captured on the tick it happens.`,
+          }
+        : {}),
       framesEvicted: this.framesEvicted,
       framesAdopted: this.framesAdopted,
       ...(this.framesAdopted > 0

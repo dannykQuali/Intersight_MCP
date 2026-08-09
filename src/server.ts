@@ -22,6 +22,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -49,6 +50,7 @@ const RECORDER_MONITORING_HINTS = {
   rediscover: 'vkvm_record_status with NO serverMoid lists every recorder, live or dormant, across all MCP servers',
 } as const;
 import { loadConfig, loadMCPServerConfig, isToolEnabled, getEnabledTools, MCPServerConfig } from './utils/config.js';
+import { validateToolArgs } from './utils/toolArgValidation.js';
 import { createSecurityHealthCheckReport } from './services/securityHealthCheckAgent.js';
 
 export class IntersightMCPServer {
@@ -4070,8 +4072,31 @@ export class IntersightMCPServer {
    * only the final value returned to the model.
    */
   private async handleToolCall(name: string, args: Record<string, any>): Promise<any> {
+    // The HTTP transport forwards the request's `parameters` verbatim, which
+    // may be absent entirely.
+    args = args || {};
+    // The MCP SDK does not enforce inputSchema.required; without this check a
+    // missing argument reaches Intersight as a garbage URL (e.g. /v1/undefined)
+    // whose 403 tells the caller nothing. Both transports (stdio and HTTP)
+    // enter through this method, so both are covered.
+    const toolDefinition = this.lookupToolDefinition(name);
+    if (toolDefinition) {
+      const problem = validateToolArgs(toolDefinition, args);
+      if (problem) {
+        throw new Error(problem);
+      }
+    }
     const raw = await this.dispatchToolCall(name, args);
     return this.slimResult(raw);
+  }
+
+  private toolIndex: Map<string, Tool> | null = null;
+
+  private lookupToolDefinition(name: string): Tool | undefined {
+    if (!this.toolIndex) {
+      this.toolIndex = new Map(this.getAllTools().map((t) => [t.name, t]));
+    }
+    return this.toolIndex.get(name);
   }
 
   /** Recursively drop boilerplate keys and MoRef `link` URLs from a result tree. */
@@ -5275,6 +5300,19 @@ export class IntersightMCPServer {
       case 'browser_status':
         return this.getBrowserService().status();
 
+      // Diagnostics that operate on the SHARED browser directly rather than on a
+      // recorder's console. They survived the move to daemons because they answer
+      // questions no daemon can: what does this page look like, and what does the
+      // API say when asked with the browser's own cookies.
+      case 'browser_goto':
+        return this.getBrowserService().goto(args.url, args.newPage);
+
+      case 'browser_evaluate':
+        return this.getBrowserService().evaluate(args.script, args.serverMoid);
+
+      case 'browser_intersight_api':
+        return this.getBrowserService().sessionApi(args.method, args.path, args.body);
+
       case 'browser_login':
         return this.getBrowserService().ensureLoggedIn({ force: args.force });
 
@@ -6271,9 +6309,13 @@ export class IntersightMCPServer {
     }
   }
 
-  async run(): Promise<void> {
-    const transport = new StdioServerTransport();
+  /** Connect over any MCP transport (stdio in production, in-memory in tests). */
+  async connect(transport: Transport): Promise<void> {
     await this.server.connect(transport);
+  }
+
+  async run(): Promise<void> {
+    await this.connect(new StdioServerTransport());
     console.error('Intersight MCP Server running on stdio');
   }
 }

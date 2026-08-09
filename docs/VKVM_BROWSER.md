@@ -98,6 +98,14 @@ Two rules that together closed a data-loss path created by the daemon split. Bef
 
 Attaching reports `framesAdopted` with an `adoptionNote` saying the frames are held outside the retention window — the attach response is the one message an operator reads. Verified live: a daemon stopped with 12 frames on disk, restarted, reported `framesStored: 12` with all 12 files intact and 12 `adopted` rows on its timeline.
 
+### A console showing nothing is recorded once, not once a minute
+
+Nine recorders were reviewed after a campaign; **six of their servers were powered off**, consoles showing a static green *"No Signal — Reason: Host power is off"*. The screen was byte-identical every tick, so the 60-second heartbeat stored a full copy of that same image forever: 1193 frames and 57 MB on one server, each frame also queued for OCR. The operator's summary was fair — *"if they even record anything it's mainly nothing."*
+
+The heartbeat still earns its place: it proves capture is alive, and `newestFrameAt` is what the dormancy and data-expiry clocks are judged on. So the cadence **backs off** rather than switching off — while a frame would be byte-identical to the one already stored, it is skipped and counted, and an anchor is kept every 30 minutes instead of every 60 seconds (~30× less volume). Anything that actually changes is stored on the tick it happens, so the moment a server powers back on is captured with no delay. `heartbeatsSuppressed` and a note say what is being skipped and why, because silence about skipped frames is how the original retention bug hid.
+
+A ticking clock is *not* byte-identical — each of those heartbeat frames carries a new time — so a live-but-quiet console keeps its normal cadence.
+
 ### Lifetimes: the process and the data are separate clocks
 
 Keeping a recorder alive is not free — it holds the server's only session slot and pokes the console with an anti-blank nudge every few minutes. Measured on one idle recorder: **zero novelty for 6.6 hours, 100 MB of frames, 110 nudges** sent to a machine nobody was watching. Frames on disk, by contrast, cost nothing but disk ([src/recorder/lifetimePolicy.ts](../src/recorder/lifetimePolicy.ts)):

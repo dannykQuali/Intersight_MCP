@@ -40,6 +40,7 @@ import {
 } from './consoleSignals.js';
 import { fromScaledFrame } from '../utils/frameCoords.js';
 import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
+import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
 import { consoleFocusPageScript } from '../utils/consoleFocus.js';
 import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
 import {
@@ -68,6 +69,11 @@ const ATTACH_RETRIES = 3;
 
 /** Time for the console to finish drawing before its text is read back. */
 const SETTLE_BEFORE_READ_MS = 600;
+/** Said whenever Enter is withheld, so the caller knows why. */
+const NOT_SUBMITTED_NOTE =
+  'Enter was NOT pressed, because the line could not be verified — an unverified command must never be executed. ' +
+  'Inspect consoleShows, clear the line, and try again.';
+
 /** Time for a line-clear to take effect before retyping. */
 const AFTER_CLEAR_MS = 250;
 
@@ -217,6 +223,32 @@ export class BrowserService {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     return null;
+  }
+
+  /** Read the console back and judge whether the text landed. */
+  private async confirmPaste(
+    page: Page,
+    text: string,
+    verify: boolean
+  ): Promise<{ verified: boolean | null; observed: string | null; problem?: string }> {
+    if (!verify) {
+      return { verified: null, observed: null };
+    }
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_BEFORE_READ_MS));
+    const shot = await page.screenshot().catch(() => null);
+    const observed = shot ? await this.frameOcr.textOfBuffer(shot).catch(() => null) : null;
+    const verdict = verifyTypedText(text, observed ?? '');
+    return { verified: verdict.matched, observed, ...(verdict.matched ? {} : { problem: verdict.reason }) };
+  }
+
+  /** Press Enter only for a line that verified. */
+  private async maybeSubmit(page: Page, submit: boolean | undefined, ok: boolean): Promise<boolean> {
+    if (!submit || !ok) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, PASTE_CHAR_DELAY_MS));
+    await page.keyboard.press('Enter', { delay: KEY_HOLD_MS }).catch(() => {});
+    return true;
   }
 
   /**
@@ -2332,6 +2364,51 @@ export class BrowserService {
         wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       };
 
+      // FIRST: the console's own paste dialog. Synthesised keystrokes cannot be
+      // made reliable at any cadence — at 100ms per key `cat /etc/network/interfaces`
+      // still reached a Proxmox prompt as `/ettttttt...ccccccc/nnnnnnn...`. The
+      // client ships a paste dialog that does the rate limiting and scancode
+      // mapping properly, so use it and keep typing only for when it is absent.
+      const viaClient = (await page
+        .evaluate(consolePastePageScript(text))
+        .catch((error: Error) => ({ ok: false, reason: `paste dialog failed: ${error.message.slice(0, 120)}` }))) as {
+        ok: boolean;
+        reason: string;
+        via?: string;
+      };
+
+      if (viaClient.ok) {
+        const settled = await this.confirmPaste(page, text, verify);
+        return {
+          ...target,
+          text,
+          method: `client paste dialog (${viaClient.via ?? 'unknown'})`,
+          verified: settled.verified,
+          submitted: await this.maybeSubmit(page, opts.submit, settled.verified !== false),
+          consoleFocused: focus.focused && focus.isConsoleCanvas,
+          focusedElement: focus.target,
+          ...(settled.problem ? { problem: settled.problem } : {}),
+          ...(settled.observed !== null && settled.verified === false
+            ? { consoleShows: settled.observed.replace(/\s+/g, ' ').trim().slice(-400) }
+            : {}),
+          ...(opts.submit && settled.verified === false ? { notSubmitted: NOT_SUBMITTED_NOTE } : {}),
+        };
+      }
+
+      // The dialog is left OPEN and focused by a half-driven paste, and then the
+      // typing fallback types into ITS textarea instead of the console — seen
+      // live, with the command half-landed in the box. Dismiss it first.
+      const closed = (await page
+        .evaluate(consolePasteClosePageScript())
+        .catch(() => ({ closed: false, reason: 'could not close the paste dialog' }))) as {
+        closed: boolean;
+        reason: string;
+      };
+      if (closed.closed) {
+        await new Promise((resolve) => setTimeout(resolve, AFTER_CLEAR_MS));
+      }
+      await this.focusConsole(page);
+
       const run = await runPasteAttempts({
         text,
         maxAttempts,
@@ -2358,16 +2435,12 @@ export class BrowserService {
       });
 
       const ok = run.verified !== false;
-      let submitted = false;
-      if (opts.submit && ok) {
-        await new Promise((resolve) => setTimeout(resolve, delayForAttempt(1, opts.charDelayMs ?? PASTE_CHAR_DELAY_MS)));
-        await page.keyboard.press('Enter', { delay: KEY_HOLD_MS }).catch(() => {});
-        submitted = true;
-      }
+      const submitted = await this.maybeSubmit(page, opts.submit, ok);
 
       return {
         ...target,
         text,
+        method: `typed key by key (the client's paste dialog was unavailable: ${viaClient.reason})`,
         attempts: run.attempts,
         verified: run.verified,
         submitted,
@@ -2378,13 +2451,7 @@ export class BrowserService {
         ...(run.observed !== null && run.verified === false
           ? { consoleShows: run.observed.replace(/\s+/g, ' ').trim().slice(-400) }
           : {}),
-        ...(opts.submit && !ok
-          ? {
-              notSubmitted:
-                'Enter was NOT pressed, because the line could not be verified — an unverified command must never ' +
-                'be executed. Inspect consoleShows, clear the line, and try again with a larger charDelayMs.',
-            }
-          : {}),
+        ...(opts.submit && !ok ? { notSubmitted: NOT_SUBMITTED_NOTE } : {}),
         ...(!verify
           ? { note: 'Typed without verification, as asked. Nothing here proves the console received it.' }
           : {}),

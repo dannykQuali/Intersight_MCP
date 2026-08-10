@@ -3691,9 +3691,9 @@ export class IntersightMCPServer {
       {
         name: 'vkvm_paste_text',
         description:
-          'Type a line of text into a server console and PROVE it arrived intact — the reliable way to enter a command, a path, or a password. ' +
-          'Raw keystrokes are not safe at machine speed: every key crosses the KVM client as a HID report, and when that pipe stalls with a key down, the auto-repeat of the guest keyboard fills the gap. Field evidence: "autoinstall" arrived as "autoiiiiiiiiiiiiiiiiiiiiinstaaaaaaaaaaaaaaaaaaaaall", 62 damaged lines with runs of 20-50 characters. ' +
-          'So this types at human speed, then READS THE CONSOLE BACK by OCR and reports whether the line matches — naming key-repeat damage specifically, which is a different fault from "nothing arrived" (that one means focus or a dead input channel). On a mismatch it clears the line (Control+u by default) and retypes more slowly. ' +
+          'Enter a line of text into a server console the RELIABLE way — for a command, a path or a password. ' +
+          'It uses the OWN paste dialog of the vKVM client (the one under the console menu), which does the rate limiting and scancode mapping properly. Synthesised keystrokes cannot be made reliable at any cadence: every key crosses the client as a HID report, and when that pipe stalls with a key down the guest keyboard auto-repeats. Field evidence: "autoinstall" arrived as "autoiiiiiiiiiiiiiiiiiiiiinstaaaaaaaaaaaaaaaaaaaaall", and even at human typing speed "cat /etc/network/interfaces" arrived as "/ettttttt...ccccccc/nnnnnnn...". ' +
+          'After pasting it READS THE CONSOLE BACK by OCR and reports whether the line matches, naming key-repeat damage specifically — a different fault from "nothing arrived", which means focus or a dead input channel. If the client offers no paste dialog it falls back to typing key by key, retyping more slowly on a mismatch, and `method` in the response says which path ran. ' +
           'It NEVER presses Enter on a line it could not verify, so a mangled command cannot execute; pass submit:true to have Enter sent only after a successful match. Typing a long line takes seconds by design, and the recorder reports a busy state with an ETA while it does.',
         inputSchema: {
           type: 'object',

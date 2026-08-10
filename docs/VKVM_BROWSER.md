@@ -395,7 +395,27 @@ The recorder's own transcript held **62 such lines, with runs of 20 to 50 identi
 
 So the browser was never the bottleneck, and the plausible-sounding theory — that the recorder's screenshots were delaying the keyup — is simply false. The stall is downstream: every keystroke crosses the KVM client's WebSocket to the BMC as a HID report, and at ~27 characters a second (the old 25 ms gap) that pipe backs up. When it stalls with a key **down**, the guest's own keyboard auto-repeat fills the gap.
 
-The remedy is cadence, verification and retry:
+**Pacing helped and did not fix it.** At 100 ms per key — human typing speed — `cat /etc/network/interfaces` still reached a Proxmox prompt as `/ettttttt…ccccccc/nnnnnnn…nnnetttttt…`. Synthesised keystrokes cannot be made reliable at *any* cadence, because the stall is in the client's HID queue and not in our timing.
+
+**So use the client's own paste.** Mapped out of the live client over CDP, the UI already ships one:
+
+```
+kvm-modal-paste[ref=modalPaste]                        (shadow)
+  kvm-modal-paste-ask-for-action                       <- unsupported characters
+  kvm-modal-paste-settings                             <- keyboard layout
+  ucs-draggable-modal[header=kvm.menu.pasteFromClipboard]
+    div[slot=body]   > ucs-textarea[ref=pasteTextarea] (shadow) > textarea
+    div[slot=footer] > ucs-button "Settings" | "Cancel" | [primary] "Send"
+```
+
+`vkvm_paste_text` drives that: opens the dialog (`updateDisplayModal`), fills the textarea, dispatches a real `input` event so the component's state updates and Send enables, and clicks **Send** — whatever rate limiting and scancode mapping the vendor does, Send does it right. All of it runs inside the page, so nothing depends on the dialog being visible or on click coordinates. Typing key-by-key remains only as the fallback, and the response's `method` says which path ran.
+
+Two things live testing taught that a fake DOM could not:
+
+- **`dispatchEvent` needs a real `Event`.** A plain `{type:'input'}` threw *"parameter 1 is not of type 'Event'"* against the client while the hand-built fake accepted it happily. The event factory is now part of the function's contract, and the fake rejects non-Events.
+- **A half-driven dialog stays open and focused**, so the typing fallback typed the command into the *dialog's own textarea* — visible in the OCR read-back as the text sitting in the box. Every failure path now dismisses the dialog and re-focuses the console first.
+
+The older remedies still apply to single keys:
 
 - **`browser_send_keys` now paces text at 100 ms per key** (~10 chars/s, the top of human typing speed — these clients are built for humans). `charDelayMs` overrides it.
 - **`vkvm_paste_text` is the tool for a line of text.** It types at that cadence, then **reads the console back by OCR** and says whether the line matches. On a mismatch it clears the line (`Control+u`) and retypes slower: 100 → 175 → 306 → 400 ms, since the previous cadence has just been disproved.

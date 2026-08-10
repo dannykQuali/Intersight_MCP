@@ -41,7 +41,9 @@ const RECORDER_MONITORING_HINTS = {
   cheapFirst:
     'vkvm_timeline (text only, no image tokens) -> vkvm_find_text (OCR search for "ERROR|FAILED|press any key") -> vkvm_recent (images, only once you know something happened)',
   input:
-    'browser_send_keys / browser_mouse for single actions; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST)',
+    'TEXT: vkvm_paste_text (uses the paste dialog of the console itself, reads the line back, and will not submit an unverified line) — '
+    + 'never browser_send_keys for a command or a password, which types blind and can deliver characters repeated dozens of times. '
+    + 'KEYS: browser_send_keys for Enter/F2/Control+Alt+Delete; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST); browser_mouse for clicks.',
   waiting: 'vkvm_wait {mode:"stable", untilText:"login:"} to sleep through healthy phases; vkvm_watch for a bounded window',
   sharing:
     'This console is held by a recorder daemon that outlives every MCP server. Other agents may attach to the same one; input is serialised by a short lease, and a refusal says who holds it.',
@@ -3606,7 +3608,7 @@ export class IntersightMCPServer {
       },
       {
         name: 'launch_vkvm_session',
-        description: 'Launch a tunneled vKVM (KVM-over-IP console) session for a physical server and open its HTML5 client in a browser tab. Requires a logged-in Intersight browser session (browser_open first). Idempotent: if a live vKVM session for this server is already open it is REUSED (a server allows only one live tunneled session, so a duplicate launch would be born-dead) — pass forceNew to force a fresh one. After launching, use browser_screenshot to SEE the server console and browser_send_keys / browser_mouse to control it.',
+        description: 'Launch a tunneled vKVM (KVM-over-IP console) session for a physical server and open its HTML5 client in a browser tab. Requires a logged-in Intersight browser session (browser_open first). Idempotent: if a live vKVM session for this server is already open it is REUSED (a server allows only one live tunneled session, so a duplicate launch would be born-dead) — pass forceNew to force a fresh one. After launching, use browser_screenshot to SEE the server console, vkvm_paste_text to enter TEXT (commands, paths, passwords) and browser_send_keys / browser_mouse for individual keys and clicks.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3655,9 +3657,8 @@ export class IntersightMCPServer {
       {
         name: 'browser_send_keys',
         description:
-          'Send keyboard input to a browser page (e.g. type into a vKVM console). "text" is typed literally as US-layout keystrokes — uppercase and symbols are delivered with a real held Shift, so passwords like "Cisco123!" arrive intact; characters with no US keystroke (e.g. accented letters) are rejected loudly rather than silently mangled. "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete". ' +
-          'Also VERIFIES delivery: it reports consoleFocused, watches for the console to react, and warns if nothing changed — "sent" alone would only mean the event was dispatched locally, which once masked a session whose input channel had silently died. To catch a prompt that only appears briefly, or to retry until the screen reacts, use vkvm_press_until instead of calling this in a loop. ' +
-          'FOR A LINE OF TEXT, PREFER vkvm_paste_text: it reads the line back off the console and retypes it if the guest key-repeat mangled it (an agent typing "autoinstall" once got "autoiiiiiiiiiiiiiiiiiiiiinstaaaa...ll"), and it refuses to press Enter on a line it could not verify. This tool types blind.',
+          'Press KEYS on a console: Enter, F2, Escape, Control+Alt+Delete, arrow keys. FOR TEXT, USE vkvm_paste_text INSTEAD — not this tool. Typing text as keystrokes is unreliable at any speed: each key crosses the KVM client as a HID report, and when that queue stalls with a key down the guest keyboard auto-repeats, so "autoinstall" arrives as "autoiiiiiiiiiiiiiiiiiiiiinstaaaaaaaaaaaaaaaaaaaaall" and "cat /etc/network/interfaces" as "/ettttttt...ccccccc/nnnnnnn...". Both were seen in the field, at 25ms AND at 100ms per key. vkvm_paste_text uses the paste dialog of the client itself, reads the line back to confirm it, and refuses to submit a line it could not verify; this tool types blind and confirms nothing. Reach for this one only for keys with no text equivalent, or for a couple of characters where a stuck key would be obvious. "text" is typed literally as US-layout keystrokes — uppercase and symbols are delivered with a real held Shift, so passwords like "Cisco123!" arrive intact; characters with no US keystroke (e.g. accented letters) are rejected loudly rather than silently mangled. "keys" are pressed in order and accept Playwright key names and combos such as "Enter", "F6", "Escape", "Control+Alt+Delete". ' +
+          'Also VERIFIES delivery: it reports consoleFocused, watches for the console to react, and warns if nothing changed — "sent" alone would only mean the event was dispatched locally, which once masked a session whose input channel had silently died. To catch a prompt that only appears briefly, or to retry until the screen reacts, use vkvm_press_until instead of calling this in a loop.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3668,7 +3669,9 @@ export class IntersightMCPServer {
             },
             text: {
               type: 'string',
-              description: 'Literal text to type',
+              description:
+                'Literal text to type, key by key. PREFER vkvm_paste_text for anything longer than a few characters — ' +
+                'text sent here can arrive with characters repeated dozens of times, and nothing here checks that it did not.',
             },
             keys: {
               type: 'array',

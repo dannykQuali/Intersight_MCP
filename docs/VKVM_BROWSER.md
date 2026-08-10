@@ -167,13 +167,16 @@ recorder releases the console on its own after 6h.
 
 ## Tool flow
 
+**Entering text: always `vkvm_paste_text`, never `browser_send_keys`.** Keystrokes are for keys — Enter, F2, `Control+Alt+Delete`, arrows. A command, a path or a password goes through the paste dialog, which verifies what landed and refuses to submit a line it could not read back. Every place that advises on input now says this (both tools' descriptions, the `text` parameter, the launch response and the monitoring hints), and [inputToolGuidance.test.ts](../test/inputToolGuidance.test.ts) keeps it there — including that the pointer appears in the first sentence rather than buried at the end, because an agent skims.
+
 ```
 browser_open                    → visible window at intersight.com; user logs in (once)
 browser_status                  → poll until loggedIn: true
 launch_vkvm_session {serverMoid}→ open the Intersight vKVM app route in a new tab
                                   (/cisco-vkvm/tunneled?selectedServerMoid=…)
 browser_screenshot {serverMoid} → PNG of the console (returned as an image)
-browser_send_keys   {text|keys} → keyboard into the console ("Control+Alt+Delete", "F6", …)
+vkvm_paste_text     {text}      → TEXT: via the client's own paste dialog, read back and verified
+browser_send_keys   {keys}      → KEYS only: "Control+Alt+Delete", "F6", "Enter", arrows
 browser_mouse       {x, y, …}   → mouse; coordinates match the screenshot's pixels
 vkvm_wait           {mode}      → block until the screen changes / stabilizes, return that frame
 vkvm_press_until    {keys}      → hammer key(s) until the screen changes/stabilizes (enter BIOS)

@@ -1724,7 +1724,11 @@ export class BrowserService {
       result.howToMonitor = {
         cheapFirst:
           'vkvm_timeline (text only, no image tokens) -> vkvm_find_text (OCR search for "ERROR|FAILED|press any key") -> vkvm_recent (images, only once you know something happened)',
-        input: 'browser_send_keys / browser_mouse for single actions; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST)',
+        input:
+          'TEXT: vkvm_paste_text — it uses the paste dialog of the console itself, reads the line back, and refuses to submit ' +
+          'a line it could not verify. Do NOT use browser_send_keys for a command or a password: it types blind, and a stalled ' +
+          'HID queue makes the guest repeat a held key ("autoinstall" -> "autoiiiiiiiiiiiiinstaaaaaall"). ' +
+          'KEYS: browser_send_keys for Enter/F2/Control+Alt+Delete; vkvm_press_until to repeat a key until the screen reacts; browser_mouse for clicks.',
         waiting: 'vkvm_wait {mode:"stable", untilText:"login:"} to sleep through healthy phases; vkvm_watch for a bounded window',
         rediscover: 'vkvm_record_status with NO serverMoid lists every recorder, e.g. after losing track of what you launched',
         // Every tool here is PULL: you find out when you next ask. On a long run

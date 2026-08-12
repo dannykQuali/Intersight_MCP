@@ -75,12 +75,34 @@ interface DetectedLine {
   box: Array<[number, number]>;
 }
 
+/**
+ * Consecutive failures before the engine is thrown away and rebuilt.
+ *
+ * Small: a broken engine costs every frame after it, and rebuilding is a one-off
+ * model load. Not 1, so a single unreadable frame does not churn the engine.
+ */
+const REBUILD_AFTER_FAILURES = 3;
+
+/** The real engine: PaddleOCR through onnxruntime, loaded on first use. */
+async function defaultEngine(): Promise<{ detect(image: string | Buffer): Promise<unknown> }> {
+  const { default: Ocr } = await import('@gutenye/ocr-node');
+  return Ocr.create();
+}
+
 export class FrameOcr {
   /** path -> recognised text. Frames are immutable, so this never goes stale. */
   private cache = new Map<string, string>();
   private engine: { detect(image: string | Buffer): Promise<unknown> } | null = null;
   private initPromise: Promise<typeof this.engine> | null = null;
   private unavailableReason: string | null = null;
+
+  /**
+   * How an engine is created. Injectable ONLY so the recovery path can be
+   * tested: a broken engine that never gets rebuilt is what cost a live campaign
+   * its transcript and its ability to wake a blanked console, and that must not
+   * ship untested again.
+   */
+  constructor(private readonly createEngine: () => Promise<{ detect(image: string | Buffer): Promise<unknown> }> = defaultEngine) {}
 
   private async getEngine(): Promise<typeof this.engine> {
     if (this.engine) {
@@ -92,8 +114,7 @@ export class FrameOcr {
     if (!this.initPromise) {
       this.initPromise = (async () => {
         try {
-          const { default: Ocr } = await import('@gutenye/ocr-node');
-          this.engine = await Ocr.create();
+          this.engine = await this.createEngine();
           return this.engine;
         } catch (error) {
           this.unavailableReason = (error as Error).message?.slice(0, 200) ?? String(error);
@@ -170,9 +191,12 @@ export class FrameOcr {
         this.cache.clear();
       }
       this.cache.set(framePath, text);
+      this.consecutiveDetectFailures = 0;
       return text;
-    } catch {
-      return null;
+    } catch (error) {
+      // Same failure path as textOfBuffer: count it, keep the reason, and rebuild
+      // a repeatedly-failing engine instead of using it forever.
+      return this.onDetectFailure(error);
     }
   }
 
@@ -183,11 +207,52 @@ export class FrameOcr {
       return null;
     }
     try {
-      return this.linesToText(await engine.detect(buf));
-    } catch {
-      return null;
+      const text = this.linesToText(await engine.detect(buf));
+      this.consecutiveDetectFailures = 0;
+      return text;
+    } catch (error) {
+      return this.onDetectFailure(error);
     }
   }
+
+  /**
+   * Remember why a recognition failed, and DISCARD an engine that keeps failing.
+   *
+   * A live recorder was found with 570 consecutive failures and zero successes:
+   * the engine had initialised fine and then broken mid-life, and because the
+   * error was swallowed and the object kept, every later frame failed the same
+   * way for the rest of the process's life. That silently removed the console
+   * transcript AND disabled waking a blanked console, whose reason is read by OCR.
+   */
+  private onDetectFailure(error: unknown): null {
+    this.lastDetectError = (error as Error)?.message?.slice(0, 200) ?? String(error);
+    this.detectFailures++;
+    this.consecutiveDetectFailures++;
+    if (this.consecutiveDetectFailures >= REBUILD_AFTER_FAILURES) {
+      // Drop it so the next call builds a fresh one. Cheaper than a dead engine.
+      this.engine = null;
+      this.initPromise = null;
+      this.consecutiveDetectFailures = 0;
+      this.rebuilds++;
+    }
+    return null;
+  }
+
+  /** What OCR is doing, for a status block that would otherwise just say "failed". */
+  health(): { failures: number; consecutive: number; rebuilds: number; lastError: string | null; unavailable: string | null } {
+    return {
+      failures: this.detectFailures,
+      consecutive: this.consecutiveDetectFailures,
+      rebuilds: this.rebuilds,
+      lastError: this.lastDetectError,
+      unavailable: this.unavailableReason,
+    };
+  }
+
+  private detectFailures = 0;
+  private consecutiveDetectFailures = 0;
+  private rebuilds = 0;
+  private lastDetectError: string | null = null;
 
   cachedCount(): number {
     return this.cache.size;

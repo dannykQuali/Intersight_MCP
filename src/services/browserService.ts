@@ -35,6 +35,7 @@ import { AgentInputTracker } from './agentInputTracker.js';
 import {
   classifyNoSignal,
   noSignalGreenFraction,
+  shouldWakeBlankedConsole,
   NoSignalState,
   NO_SIGNAL_GREEN_THRESHOLD,
 } from './consoleSignals.js';
@@ -1382,9 +1383,18 @@ export class BrowserService {
    * which is what finally triggered recovery. Detecting the green state
    * directly cuts that dead time.
    */
-  private async isConsoleDisconnected(page: Page): Promise<'inactivity' | 'dropped' | null> {
+  private async isConsoleDisconnected(page: Page): Promise<'inactivity' | 'dropped' | 'blanked-unknown' | null> {
     const state = await this.consoleNoSignal(page);
-    return state.kind === 'inactivity' || state.kind === 'dropped' ? state.kind : null;
+    if (state.kind === 'dropped') {
+      return 'dropped';
+    }
+    // A blank screen whose reason could not be read is still worth a keypress —
+    // see shouldWakeBlankedConsole. Reported separately so the recorder's event
+    // log says which of the two it acted on.
+    if (shouldWakeBlankedConsole(state)) {
+      return state.kind === 'inactivity' ? 'inactivity' : 'blanked-unknown';
+    }
+    return null;
   }
 
   /**
@@ -2899,6 +2909,11 @@ export class BrowserService {
       const drift = toggled ? 3 : -3;
       await page.mouse.move(820 + drift, 500 + drift);
       if (mode === 'key') {
+        // FOCUS FIRST. The client only forwards keys that arrive on the console
+        // canvas, so an unfocused press is dropped — the wake path has always
+        // focused first, and this one silently did not, which made 'key' mode no
+        // better than 'mouse' mode.
+        await this.focusConsole(page).catch(() => undefined);
         // Modifier only: produces no character and submits nothing.
         await page.keyboard.press('Shift');
       }
@@ -2945,6 +2960,9 @@ export class BrowserService {
       wakeConsole: () => this.wakeConsole(serverMoid),
       // One shared OCR worker across every recorder, not one each.
       ocrFrame: (framePath) => this.frameOcr.textOf(framePath),
+      ocrHealth: () => this.frameOcr.health(),
+      // Input the agent sent counts as activity, so the nudge does not pile on top.
+      lastAgentInputAt: () => this.agentInput.lastInputAtFor(serverMoid),
       // Session timeouts are expected on long runs: re-login and relaunch the
       // console, then hand the new page back so recording continues.
       recover: () => this.recoverConsole(serverMoid),

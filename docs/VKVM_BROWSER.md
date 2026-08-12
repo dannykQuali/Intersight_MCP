@@ -443,6 +443,28 @@ Pass `verifyMs: 0` for deliberately blind input. Note this is a *best-effort* si
 
 **Which server did that call hit?** Tools that accept an optional `serverMoid` fall back to the most recently opened tab, which with four sessions open is the wrong server surprisingly often. `browser_screenshot`, `browser_send_keys` and `browser_mouse` now echo a `targeted: {serverMoid, serverName}` block, plus a `targetWarning` when no moid was given and more than one session is open.
 
+### The green "User Inactivity" screen, and why the nudge looked broken
+
+An operator watched a C240 mid-ESXi-install blank three times in 40 minutes — the green *"No Signal — Reason: User Inactivity — Press a key to wake up the system"* screen — each time clearing the instant they moved a real mouse over it. The recorder reported `wakes: 0` for 28 hours. Measured from that recorder's own frames and status:
+
+| Evidence | Value |
+|---|---|
+| Green fraction of those frames | **0.815** (detection threshold is 0.5) |
+| OCR of the same file, fresh process | reads the reason perfectly |
+| OCR inside that daemon | **570 failures, 0 successes**, `ocrUnavailable: null` |
+| Green episodes | 127 s, 241 s, 149 s — 15.7 and 21.1 minutes apart |
+| Anti-blank nudges | 32 in 28 hours; the 00:02 episode ended at 00:06:01 = `lastNudgeAt` |
+
+Three independent faults, each fixed:
+
+**1. The CIMC blanks on INPUT idleness, not on a quiet screen.** The guest was installing the whole time — the frames either side show the installer had advanced — but no HID input arrived, so the CIMC stopped streaming. `shouldNudge` counted screen NOVELTY as activity, so a scrolling installer refreshed the deadline every second and the nudge was almost never due. It now measures only input: our own nudges and the agent's keystrokes. The old "don't nudge a busy console" rule is gone, and deliberately so — what protects a working console is *what* is sent (a bare modifier plus a 3-pixel drift, which types nothing and submits nothing), not withholding it.
+
+**2. Waking depended on OCR, so a broken engine disabled it.** The reason line is pixels, so it is read by OCR; with OCR dead, `classifyNoSignal` returned `unknown` and the recorder ignored it. A blank screen whose reason cannot be read is now treated as wake-worthy — `shouldWakeBlankedConsole` says yes for `inactivity` **and** `unknown`, and no only for `power-off` and `dropped`, where a key cannot help. So a wake now happens within one dead-check cycle instead of waiting up to the full 240-second anti-blank window.
+
+**3. The `key` nudge never focused the canvas.** The wake path always did; the periodic nudge did not, and the client only forwards keys that arrive on `canvas#kvmCanvas`. So in `key` mode the keypress was being dropped and only the mouse drift survived — which is why the operator's real mouse worked and ours appeared not to.
+
+Plus the reason none of this was visible: `textOfBuffer` swallowed every engine error and kept the dead engine forever. It now records the reason, counts the streak, and **rebuilds the engine after three consecutive failures**, and `vkvm_record_status` reports `ocr.engine` with the failure count, rebuild count and last error. An engine that cannot be built at all is still reported as `unavailable`, because that is a different fault with a different remedy.
+
 ### Keeping console evidence longer than the ring buffer
 
 The recording is a rolling window: frames older than `retentionMinutes` (default 240) are **deleted permanently**. A 10.5-hour campaign on the default lost roughly 60% of its console history, and the first sign was frames simply not being there when someone went looking — hours after anything could be done.

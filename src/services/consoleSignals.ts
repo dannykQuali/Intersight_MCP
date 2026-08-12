@@ -162,3 +162,26 @@ export function classifyNoSignal(
   }
   return { blanked: true, kind: 'unknown', reason, remedy: null };
 }
+
+/**
+ * Is a bare keypress worth trying on this screen?
+ *
+ * Yes for a console we know is asleep, and ALSO for one that is blank for a
+ * reason we could not read — because the remedy costs nothing. A bare modifier
+ * types nothing and submits nothing, and it is precisely what the screen asks
+ * for; requiring proof of WHY the screen is blank before trying it is what let a
+ * broken OCR engine disable waking entirely.
+ *
+ * Field case: a recorder whose every OCR call failed classified a 0.815-green
+ * "User Inactivity" screen as `unknown` and reported `wakes: 0` for 28 hours,
+ * while the console sat blank for two to four minutes at a time.
+ *
+ * No for the two states a key cannot help: a powered-off host, and a dropped
+ * connection that needs the session rebuilt.
+ */
+export function shouldWakeBlankedConsole(state: NoSignalState): boolean {
+  if (!state.blanked) {
+    return false;
+  }
+  return state.kind === 'inactivity' || state.kind === 'unknown';
+}

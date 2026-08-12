@@ -1,12 +1,23 @@
 /**
- * When is an idle console due for an anti-blank nudge?
+ * When is a console due for an anti-blank nudge?
  *
- * Regression: the idle test folded in `lastPixelChangeAt`, which is refreshed
- * by ANY sub-threshold repaint. A Windows taskbar clock repaints once a minute
- * forever, so a booted desktop never reached the 240s idle mark and was never
- * nudged - observed live: 0 nudges in 11 minutes on C240, while a static UEFI
- * console nudged on schedule. A console blanks on INPUT idle; it does not care
- * that its own clock is ticking.
+ * This rule has been wrong twice, in the same direction, and the fix each time
+ * was to stop treating the SCREEN as evidence of activity.
+ *
+ * First: the idle test folded in `lastPixelChangeAt`, refreshed by any
+ * sub-threshold repaint. A Windows taskbar clock repaints once a minute forever,
+ * so a booted desktop never reached the 240s mark — 0 nudges in 11 minutes on
+ * C240, while a static UEFI console nudged on schedule.
+ *
+ * Then: it keyed off screen NOVELTY and required the screen to be at rest. A
+ * scrolling ESXi installer produces novelty every second and is never at rest, so
+ * the nudge fired 32 times in 28 hours and the CIMC blanked the console anyway —
+ * three green "User Inactivity" screens in 40 minutes, 127 to 241 seconds each,
+ * while the install carried on throughout.
+ *
+ * A console blanks on INPUT idle. It does not care that its own clock is ticking,
+ * and it does not care that an installer is scrolling. So the rule measures only
+ * input: our nudges, and the agent's own keystrokes.
  */
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
@@ -25,6 +36,7 @@ function idleConsole(overrides: Partial<NudgeDecision> = {}): NudgeDecision {
     needsInitialNudge: false,
     lastNoveltyAt: NOW - 600_000,
     lastNudgeAt: NOW - 600_000,
+    lastAgentInputAt: 0,
     startedAt: NOW - 600_000,
     stillSamples: 30,
     ...overrides,
@@ -39,15 +51,28 @@ describe('shouldNudge', () => {
     assert.equal(shouldNudge(decision), true);
   });
 
-  it('does not nudge a console that is actively working', () => {
-    // A spinner/progress bar changes on essentially every sample.
-    assert.equal(shouldNudge(idleConsole({ stillSamples: 0 })), false);
-    assert.equal(shouldNudge(idleConsole({ stillSamples: STILL_SAMPLES_BEFORE_NUDGE - 1 })), false);
+  it('DOES nudge a console that is actively working', () => {
+    // Reversed deliberately. This once asserted the opposite, on the reasoning
+    // that a busy console should not be disturbed — but the CIMC blanks on input
+    // idleness regardless of how busy the guest is, so "busy" was exactly the
+    // case where the nudge was needed and never came. What protects a working
+    // console is WHAT is sent (a bare modifier, a 3px drift), not withholding it.
+    assert.equal(shouldNudge(idleConsole({ stillSamples: 0 })), true);
+    assert.equal(shouldNudge(idleConsole({ stillSamples: STILL_SAMPLES_BEFORE_NUDGE - 1 })), true);
   });
 
-  it('does not nudge while real console output is flowing', () => {
-    // Novel content moments ago: boot messages, an installer step.
-    assert.equal(shouldNudge(idleConsole({ lastNoveltyAt: NOW - 1000 })), false);
+  it('DOES nudge while real console output is flowing', () => {
+    // Boot messages or an installer step a second ago say nothing about whether
+    // the CIMC has seen input. Under the old rule this postponed the nudge every
+    // second, forever, and the console blanked mid-install.
+    assert.equal(shouldNudge(idleConsole({ lastNoveltyAt: NOW - 1000 })), true);
+  });
+
+  it('treats the agent’s own input as activity', () => {
+    // An agent typing has already reset the CIMC's timer; nudging on top of that
+    // is pointless traffic.
+    assert.equal(shouldNudge(idleConsole({ lastAgentInputAt: NOW - 1000 })), false);
+    assert.equal(shouldNudge(idleConsole({ lastAgentInputAt: NOW - 600_000 })), true);
   });
 
   it('waits the full anti-blank window after the previous nudge', () => {

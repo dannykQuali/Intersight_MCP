@@ -82,15 +82,15 @@ describe('VkvmRecorder anti-blank', () => {
     assert.equal(recorder.status().antiBlank.nudgesSent, nudges.length);
   });
 
-  it('never nudges a console that is actively working', async () => {
-    // Genuinely new content on every sample, landing in fresh places — an
-    // installer writing output. Novelty keeps refreshing, so no nudge.
+  it('nudges a console that is actively working, because the CIMC blanks it anyway', async () => {
+    // Reversed deliberately, from a live case: an ESXi install scrolled
+    // continuously for 28 hours, the old rule read that as "busy, leave it
+    // alone", and the CIMC blanked the video three times in 40 minutes regardless.
+    // The nudge is a bare modifier and a 3px drift — nothing an install can
+    // notice — so the safe choice is to send it.
     const { recorder, nudges } = consoleRecorder((n) => movingMarkFrame(n));
     recorder.start();
-
-    await waitFor(() => nudges.length >= 1, 5000, 'the on-attach nudge');
-    // Well past the 2s anti-blank window - a busy console must still be left alone.
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    assert.equal(nudges.length, 1, 'only the on-attach nudge; the console is busy');
+    await waitFor(() => nudges.length >= 1, 10000, 'a nudge on a continuously busy console');
+    assert.ok(recorder.status().antiBlank.nudgesSent >= 1);
   });
 });

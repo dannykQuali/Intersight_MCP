@@ -93,6 +93,17 @@ export class AgentInputTracker {
   }
 
   /** True while the agent is using this console, or has just used it. */
+  /**
+   * When input was last delivered to this console, or 0 if never.
+   *
+   * The anti-blank rule needs it: the CIMC blanks on INPUT idleness, so an agent
+   * that has been typing has already kept the console awake and a nudge on top is
+   * pointless traffic.
+   */
+  lastInputAtFor(scope: string): number {
+    return this.lastInputAt.get(scope) ?? 0;
+  }
+
   isBusy(scope: string): boolean {
     if (this.isInputInFlight(scope)) {
       return true;

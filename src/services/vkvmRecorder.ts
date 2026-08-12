@@ -62,13 +62,21 @@ export interface NudgeDecision {
   state: string;
   /** Attached to a console we have not nudged yet - it may already be blanked. */
   needsInitialNudge: boolean;
-  /** Last NOVEL change: new content appearing, as classified by the tile tracker. */
+  /**
+   * Last NOVEL change. Kept for reporting only: it no longer influences the
+   * decision, because a busy SCREEN does not stop the CIMC blanking a console
+   * that has received no INPUT.
+   */
   lastNoveltyAt: number;
+  /** When we last delivered a nudge — input, and therefore activity. */
   lastNudgeAt: number;
+  /** When the agent last sent input of its own. Also activity. */
+  lastAgentInputAt: number;
   startedAt: number;
   /**
-   * Consecutive samples with the screen at rest — pixel-identical, or moving
-   * only by a blink (an oscillating tile returning to a known state).
+   * Consecutive samples with the screen at rest. Reported, not decisive: a bare
+   * modifier and a 3px drift cannot disturb a console, and requiring stillness
+   * meant a scrolling installer was never nudged at all.
    */
   stillSamples: number;
 }
@@ -132,19 +140,22 @@ export function meaningfulText(text: string | null): string {
 }
 
 /**
- * Decide whether an idle console is due for an anti-blank nudge.
+ * Decide whether a console is due for an anti-blank nudge.
  *
- * Idleness is measured from NOVELTY - new content appearing, as classified by
- * the tile tracker - not from pixel movement. This rule has been wrong twice:
- * keying off stored changes missed slow output, and keying off any pixel
- * movement silently disabled anti-blank on every booted OS (a taskbar clock
- * ticks forever, so the console never looked idle - verified live, 0 nudges in
- * 11 minutes on a Windows console). A console blanks on INPUT idle; a clock
- * repainting itself is not input, and the tracker knows the difference.
+ * Measured from INPUT, because that is the only clock the CIMC watches: it stops
+ * streaming video when no HID input arrives, however busy the guest is. Verified
+ * on a C240 running an ESXi install — three green "User Inactivity" screens in 40
+ * minutes, 127 to 241 seconds each, while the installer advanced throughout.
  *
- * The original intent - never inject input into a console that is busy - is
- * preserved by `stillSamples`, which requires the screen to be quiet at the
- * moment we act rather than for the whole window.
+ * This rule has now been wrong twice in the same way. Keying off stored changes
+ * missed slow output; keying off screen NOVELTY (a clock, a spinner, a scrolling
+ * installer) let a busy screen postpone the nudge forever, so the console blanked
+ * on the CIMC's own schedule while the recorder believed all was well.
+ *
+ * The original worry — never inject input into a console that is busy — is
+ * answered by WHAT is injected rather than when: a bare modifier that types
+ * nothing plus a three-pixel mouse drift. An in-flight agent interaction is still
+ * a reason to hold off, and that is enforced by the caller.
  */
 export function shouldNudge(d: NudgeDecision): boolean {
   if (d.mode === 'none' || d.antiBlankSeconds <= 0 || d.state !== 'recording') {
@@ -156,11 +167,14 @@ export function shouldNudge(d: NudgeDecision): boolean {
   if (d.needsInitialNudge) {
     return true;
   }
-  const idleSince = Math.max(d.lastNoveltyAt, d.lastNudgeAt, d.startedAt);
-  if (d.now - idleSince < d.antiBlankSeconds * 1000) {
-    return false;
-  }
-  return d.stillSamples >= STILL_SAMPLES_BEFORE_NUDGE;
+  // ONLY input counts. The CIMC stops streaming video when it receives no HID
+  // input, whatever the guest is drawing — measured on a C240 mid-install: three
+  // blanks in 40 minutes, 15.7 and 21.1 minutes apart, while the installer
+  // carried on the whole time. Counting screen novelty as activity (as this once
+  // did) meant a scrolling installer refreshed the deadline every second and the
+  // nudge fired 32 times in 28 hours, so the console blanked anyway.
+  const lastInputAt = Math.max(d.lastNudgeAt, d.lastAgentInputAt, d.startedAt);
+  return d.now - lastInputAt >= d.antiBlankSeconds * 1000;
 }
 
 /**
@@ -178,11 +192,26 @@ export interface RecorderHooks {
    */
   isSessionDeadViaApi?: () => Promise<boolean | null>;
   /**
+   * What the OCR engine is doing, so a silent failure is visible in status.
+   *
+   * A live recorder was found with 570 consecutive failures and no way to see
+   * why: the error was swallowed, and a blanked console cannot be classified
+   * without text, so waking it stopped working too.
+   */
+  ocrHealth?: () => Record<string, unknown>;
+  /**
+   * When the agent last sent input to this console, or 0 if never.
+   *
+   * The anti-blank rule is measured from input, so an agent that has been typing
+   * has already kept the console awake and needs no nudge on top.
+   */
+  lastAgentInputAt?: () => number;
+  /**
    * True while the console shows the "No Signal / connection dropped" screen.
    * DEGRADED rather than dead — the client frequently reconnects on its own, so
    * the recorder only acts if it persists.
    */
-  isConsoleDisconnected?: (page: Page) => Promise<'inactivity' | 'dropped' | null>;
+  isConsoleDisconnected?: (page: Page) => Promise<'inactivity' | 'dropped' | 'blanked-unknown' | null>;
   /**
    * Wake a console asleep from user inactivity (sends a harmless key). Relaunching
    * does NOT fix that state; the screen asks for a keypress.
@@ -712,7 +741,12 @@ export class VkvmRecorder {
         // for the terminal dialog - that cost ~2 minutes of blindness live.
         if (this.hooks.isConsoleDisconnected) {
           const state = await this.hooks.isConsoleDisconnected(this.page).catch(() => null);
-          if (state === 'inactivity') {
+          // 'blanked-unknown' is treated exactly like inactivity: the screen IS a
+          // placeholder (proved by pixels) and a bare modifier is free to try.
+          // Requiring a readable reason first is what let a broken OCR engine
+          // disable waking entirely — a live recorder reported wakes: 0 across 28
+          // hours while its console sat green for minutes at a time.
+          if (state === 'inactivity' || state === 'blanked-unknown') {
             // The host video is asleep, not disconnected. Relaunching would not
             // help; send the keypress the screen is asking for.
             this.disconnectedStreak = 0;
@@ -857,6 +891,7 @@ export class VkvmRecorder {
       needsInitialNudge: this.needsInitialNudge,
       lastNoveltyAt: this.lastNoveltyAt,
       lastNudgeAt: this.lastNudgeAt,
+      lastAgentInputAt: this.hooks.lastAgentInputAt?.() ?? 0,
       startedAt: this.startedAt,
       stillSamples: this.stillSamples,
     });
@@ -1358,6 +1393,10 @@ export class VkvmRecorder {
         skipped: this.ocrSkipped,
         failures: this.ocrFailures,
         transcript: path.join(this.dir, OCR_TEXT_FILENAME),
+        // Surfaced because a recorder was found with 570 failures and no way to
+        // see WHY: the reason was swallowed, so "OCR is failing" was all anyone
+        // could learn, and a blanked console cannot be classified without text.
+        ...(this.hooks.ocrHealth ? { engine: this.hooks.ocrHealth() } : {}),
       },
       heartbeatsSuppressed: this.heartbeatsSuppressed,
       ...(this.heartbeatsSuppressed > 0

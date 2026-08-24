@@ -48,6 +48,7 @@ Each test file opens with the live failure it exists to prevent:
 | [recorderOcrText.test.ts](../test/recorderOcrText.test.ts) | A parked installer reading as a calm machine because only its words changed, not its pixels |
 | [frameOcrLifetime.test.ts](../test/frameOcrLifetime.test.ts) | A process that used OCR never exiting — which would break any background waiter, since its notification fires on exit |
 | [frameOcrAccuracy.test.ts](../test/frameOcrAccuracy.test.ts) | The real OCR engine regressing on dense console text, inventing text on a blank frame, or leaking browser chrome into the transcript |
+| [loginButtonReady.test.ts](../test/loginButtonReady.test.ts) | Clicking "Sign In with Cisco ID" while it is still `disabled` under the page's loading overlay — Playwright cannot see a custom element's disabled attribute, so it burned a 30s click timeout and killed the login |
 | [consoleFocus.test.ts](../test/consoleFocus.test.ts) | Keyboard input being dispatched into page chrome because the shadow-DOM traversal never reached the console canvas |
 | [keyboardText.test.ts](../test/keyboardText.test.ts) | Shifted characters arriving unshifted at the BMC (`Cisco123!` → `cisco1231`) because no real Shift keydown was ever sent |
 | [tileNovelty.test.ts](../test/tileNovelty.test.ts) | The change-magnitude threshold judging a password dot and a cursor blink identically (~0.0003 each) — changes are now classified by region history instead of measured |

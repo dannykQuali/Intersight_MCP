@@ -118,3 +118,44 @@ Diagnostics: every login records a URL trail in `stepsCompleted`, and a failure 
 - The keepalive timer is `unref`'d, so it never keeps the process alive on its own.
 
 **Status:** validated live 2026-07-28 — a cold automated login from a fresh browser profile completed the whole Cisco ID chain (including TOTP and the 3-account chooser) and ended authenticated on the regional host. TOTP generation is verified against the RFC 6238 test vectors; credential loading, masking, the no-credentials path, and the lockout guard are verified too.
+
+## Never click the Cisco ID button before the page is ready
+
+A login died this way on 2026-08-24, and the operator's description was exactly
+right: *"the Sign in with Cisco ID button showed a loading icon for about a
+minute"*. From the daemon's own log:
+
+```
+waiting for locator(':text("Sign In with Cisco ID")').first()
+  - locator resolved to <ucs-button disabled ... id="submitButton" ...>
+- attempting click action
+  57 x waiting for element to be visible, enabled and stable
+     - <div class="login-container">...</div> intercepts pointer events
+   - retrying click action
+locator.click: Timeout 30000ms exceeded.
+```
+
+Two faults at once:
+
+1. The button carried a **`disabled` attribute** while the widget booted. It is a
+   custom element (`ucs-button`), and Playwright's enabled-check understands
+   native form controls and `aria-disabled` — **not** a bare attribute on a custom
+   element. So it believed the button was clickable.
+2. The page's own loading overlay, **`div.login-container`**, covered it, so every
+   hit test failed and the click spent its full 30-second timeout retrying.
+
+The attempt was then spent; the retry 28 seconds later landed on a
+half-initialised page where the username field never appeared either, giving the
+misleading `Could not find the username field on the Cisco ID login page`. The
+daemon went `degraded` and backed off 60s, 120s, 240s.
+
+So the click now waits for readiness first
+([loginButtonReady.ts](../src/utils/loginButtonReady.ts)): up to 45 seconds for
+the button to lose `disabled`/`aria-disabled` **and** for a hit test at its centre
+to reach the button rather than an overlay. Every blocker is named in the login
+steps, because "not ready" alone leaves the next reader to reverse-engineer 57
+identical Playwright retry lines. The click itself is then bounded at 10 seconds,
+and if an overlay outlasts the wait a programmatic in-page click is used — no
+overlay can intercept that, and by then the button is enabled so the click means
+something. Clicking a still-disabled button is explicitly refused: it would do
+nothing while looking like success.

@@ -42,6 +42,13 @@ import {
 import { fromScaledFrame } from '../utils/frameCoords.js';
 import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
+import {
+  isLoginButtonReady,
+  loginButtonBlockers,
+  loginButtonClickPageScript,
+  loginButtonStatePageScript,
+  type LoginButtonState,
+} from '../utils/loginButtonReady.js';
 import { consoleFocusPageScript } from '../utils/consoleFocus.js';
 import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
 import {
@@ -61,6 +68,17 @@ import { verifyTypedText } from '../utils/typedTextVerdict.js';
  * timeout here was read as "no browser" and triggered a destructive spawn.
  */
 const ATTACH_TIMEOUT_MS = 20000;
+
+/**
+ * How long to wait for the Cisco ID login button to become clickable.
+ *
+ * Generous: the page was still booting after 30s in the field, and waiting costs
+ * nothing while clicking early costs the whole login attempt.
+ */
+const LOGIN_BUTTON_READY_MS = 45000;
+
+/** Bounded click, because the wait above is what gives the page its time. */
+const LOGIN_CLICK_TIMEOUT_MS = 10000;
 
 /** Liveness probe for a published CDP endpoint. Cheap HTTP, no page attach. */
 const ENDPOINT_PROBE_MS = 3000;
@@ -698,6 +716,32 @@ export class BrowserService {
   }
 
   /** Try a list of candidate selectors, returning the first that becomes visible. */
+  /**
+   * Poll until the Cisco ID button is clickable, reporting what blocked it.
+   *
+   * Cheaper than discovering it through a click timeout, and far more
+   * diagnosable: the live failure produced 57 identical Playwright retry lines
+   * and no statement of the cause.
+   */
+  private async waitForLoginButtonReady(
+    page: Page,
+    timeoutMs: number
+  ): Promise<{ ready: boolean; blockers: string[] }> {
+    const deadline = Date.now() + timeoutMs;
+    let blockers: string[] = ['the readiness probe never ran'];
+    while (Date.now() < deadline) {
+      const state = (await page
+        .evaluate(loginButtonStatePageScript())
+        .catch(() => null)) as LoginButtonState | null;
+      blockers = loginButtonBlockers(state);
+      if (isLoginButtonReady(state)) {
+        return { ready: true, blockers: [] };
+      }
+      await page.waitForTimeout(500);
+    }
+    return { ready: false, blockers };
+  }
+
   private async firstVisible(page: Page, selectors: string[], timeoutMs = 8000): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -909,8 +953,39 @@ export class BrowserService {
         10000
       );
       if (ciscoIdBtn) {
-        await page.locator(ciscoIdBtn).first().click();
-        steps.push('clicked "Sign In with Cisco ID"');
+        // WAIT for the button to be genuinely clickable before clicking it.
+        // Clicking early killed a real login on 2026-08-24: the button was
+        // <ucs-button disabled> under the page's own div.login-container overlay,
+        // and because Playwright's enabled-check cannot see a custom element's
+        // disabled attribute it spent the entire 30s click timeout retrying the
+        // hit test (57 attempts, in the daemon log) while the operator watched a
+        // spinner on the button. The attempt then died and the retry landed on a
+        // half-initialised page where the username field never appeared either.
+        const ready = await this.waitForLoginButtonReady(page, LOGIN_BUTTON_READY_MS);
+        if (!ready.ready) {
+          steps.push(
+            `"Sign In with Cisco ID" still not clickable after ${Math.round(LOGIN_BUTTON_READY_MS / 1000)}s: ` +
+              ready.blockers.join('; ')
+          );
+        }
+        const btn = page.locator(ciscoIdBtn).first();
+        try {
+          // Bounded: a long timeout here only delays the diagnosis, since the
+          // readiness wait above is what actually gives the page time.
+          await btn.click({ timeout: LOGIN_CLICK_TIMEOUT_MS });
+          steps.push('clicked "Sign In with Cisco ID"');
+        } catch (error) {
+          // An overlay can outlast the wait. A programmatic click cannot be
+          // intercepted, and by now the button is enabled, so it is honoured.
+          const clicked = await page
+            .evaluate(loginButtonClickPageScript())
+            .catch(() => false);
+          steps.push(
+            clicked
+              ? 'clicked "Sign In with Cisco ID" in-page (an overlay was blocking a real click)'
+              : `could not click "Sign In with Cisco ID": ${String((error as Error).message).slice(0, 160)}`
+          );
+        }
         await page.waitForLoadState('domcontentloaded').catch(() => {});
       }
 

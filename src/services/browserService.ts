@@ -42,6 +42,7 @@ import {
 import { fromScaledFrame } from '../utils/frameCoords.js';
 import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
+import { lockoutExemptionReason } from '../utils/loginFailureClassification.js';
 import {
   isLoginButtonReady,
   loginButtonBlockers,
@@ -142,6 +143,11 @@ export class BrowserService {
   // risk locking the Cisco ID account, so auto-login self-disables after a few.
   private loginFailures = 0;
   private static readonly MAX_LOGIN_FAILURES = 3;
+  /**
+   * Failures that never sent a credential. Reported, retried freely, and
+   * deliberately kept OUT of the lockout budget: they cannot lock an account.
+   */
+  private mechanicalLoginFailures = 0;
   private loginDisabledReason: string | null = null;
   // The shared browser is a DETACHED OS process owned by no MCP instance: every
   // instance attaches to it over CDP (a profile can only be owned by one
@@ -676,6 +682,7 @@ export class BrowserService {
       debug: this.sso.debug,
       logins: this.loginCount,
       consecutiveFailures: this.loginFailures,
+      mechanicalFailures: this.mechanicalLoginFailures,
       autoLoginDisabledReason: this.loginDisabledReason,
       lastLoginAt: this.lastLoginAt ? new Date(this.lastLoginAt).toISOString() : null,
       lastKeepalive: this.lastKeepalive
@@ -833,6 +840,8 @@ export class BrowserService {
     if (opts?.force) {
       // An explicit forced login re-arms the failure circuit breaker.
       this.loginFailures = 0;
+    this.mechanicalLoginFailures = 0;
+      this.mechanicalLoginFailures = 0;
       this.loginDisabledReason = null;
     }
     if (!opts?.force && (await this.isLoggedIn())) {
@@ -1100,11 +1109,42 @@ export class BrowserService {
         // ignore
       }
       const message = (error as Error).message;
+      // Only a failure that actually SUBMITTED a credential can lock the account,
+      // so only that kind spends the lockout budget. Counting mechanical failures
+      // disarmed automatic login for a daemon whose credentials were never in
+      // question — a click timeout on a still-disabled button and a missing
+      // username field were enough to reach "disabled after 3 consecutive
+      // failures", leaving it degraded with no way back.
+      const exemption = lockoutExemptionReason(steps);
+      if (exemption) {
+        this.mechanicalLoginFailures++;
+        console.error(
+          `Intersight auto-login failed before any credential was sent ` +
+            `(mechanical failure ${this.mechanicalLoginFailures}, lockout budget untouched at ` +
+            `${this.loginFailures}/${BrowserService.MAX_LOGIN_FAILURES}): ${message} — ${exemption}.`
+        );
+        return {
+          loggedIn: false,
+          action: 'login-failed',
+          error: message,
+          failureKind: 'mechanical',
+          lockoutExemption: exemption,
+          consecutiveFailures: this.loginFailures,
+          mechanicalFailures: this.mechanicalLoginFailures,
+          autoLoginDisabled: !!this.loginDisabledReason,
+          stepsCompleted: steps,
+          debugScreenshot: debugShot,
+          hint:
+            'This attempt never reached the password, so retrying is safe and automatic login stays armed. ' +
+            'Inspect the debug screenshot and stepsCompleted to see how far it got.',
+        };
+      }
       this.loginFailures++;
       if (this.loginFailures >= BrowserService.MAX_LOGIN_FAILURES) {
         this.loginDisabledReason =
-          `Automatic login is disabled after ${this.loginFailures} consecutive failures (last error: ${message}). ` +
-          'This guard exists so a wrong password is not retried until the Cisco ID account locks out. ' +
+          `Automatic login is disabled after ${this.loginFailures} consecutive CREDENTIAL failures (last error: ${message}). ` +
+          'This guard exists so a wrong password is not retried until the Cisco ID account locks out; only attempts that ' +
+          'actually submitted a credential are counted, so this really is about the credentials. ' +
           'Fix the credentials, then call browser_login with force:true to re-arm, or log in manually in the browser window.';
         this.stopKeepalive();
         console.error(`Intersight auto-login disabled after ${this.loginFailures} consecutive failures.`);
@@ -1115,7 +1155,9 @@ export class BrowserService {
         loggedIn: false,
         action: 'login-failed',
         error: message,
+        failureKind: 'credential',
         consecutiveFailures: this.loginFailures,
+        mechanicalFailures: this.mechanicalLoginFailures,
         autoLoginDisabled: !!this.loginDisabledReason,
         stepsCompleted: steps,
         debugScreenshot: debugShot,
@@ -1331,6 +1373,7 @@ export class BrowserService {
     }
     // Success re-arms the circuit breaker.
     this.loginFailures = 0;
+    this.mechanicalLoginFailures = 0;
     this.loginDisabledReason = null;
     // Any vKVM tab from a previous (now-dead) session is useless; drop them so
     // the agent relaunches instead of screenshotting a dead console.

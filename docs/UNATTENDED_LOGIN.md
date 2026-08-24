@@ -159,3 +159,47 @@ and if an overlay outlasts the wait a programmatic in-page click is used — no
 overlay can intercept that, and by then the button is enabled so the click means
 something. Clicking a still-disabled button is explicitly refused: it would do
 nothing while looking like success.
+
+## The lockout guard counts credentials, not mechanical failures
+
+Automatic login disarms itself after three consecutive failures. That guard has
+exactly one purpose — stop a wrong password being retried until the Cisco ID
+account locks — so it must only count attempts that could actually cause a
+lockout.
+
+It used to count everything. On 2026-08-24 a recorder failed twice for reasons
+that never sent a credential to anyone (`locator.click: Timeout 30000ms exceeded`
+on a still-disabled button, then `Could not find the username field`) and the
+guard duly reported:
+
+```
+Intersight auto-login disabled after 3 consecutive failures.
+```
+
+The account had never been touched, and the daemon had just switched off the one
+mechanism that could recover it — so it sat `degraded`, with no console, retrying
+a login it had itself disabled.
+
+The dividing line is **credential submission**
+([loginFailureClassification.ts](../src/utils/loginFailureClassification.ts)):
+
+| How far the attempt got | Counts toward lockout? |
+|---|---|
+| Page never loaded, button not clickable, username field missing | **No** — mechanical |
+| Username submitted (identifier-first IdP discovery) | **No** — nothing is verified, no sign-in fails |
+| **Password submitted** | **Yes** |
+| **TOTP / MFA submitted** | **Yes** |
+| Failure at the account chooser, after Cisco ID accepted us | No — an Intersight problem, not a credential one |
+
+Mechanical failures are counted separately as `mechanicalFailures`, reported in
+`browser_status`, retried freely, and logged with the exemption stated in the same
+line — because "auto-login failed (1/3)" printed next to a click timeout is
+exactly what made the old behaviour look reasonable:
+
+```
+Intersight auto-login failed before any credential was sent (mechanical failure 1,
+lockout budget untouched at 0/3): locator.click: Timeout 30000ms exceeded —
+no credential was submitted, so this failure cannot lock the Cisco ID account
+and is not counted toward the auto-login lockout guard.
+```
+

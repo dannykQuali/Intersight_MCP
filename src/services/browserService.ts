@@ -43,6 +43,7 @@ import { fromScaledFrame } from '../utils/frameCoords.js';
 import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
 import { lockoutExemptionReason } from '../utils/loginFailureClassification.js';
+import { CISCO_ID_EMAIL_SELECTORS } from '../utils/intersightLoginForm.js';
 import {
   isLoginButtonReady,
   loginButtonBlockers,
@@ -951,6 +952,24 @@ export class BrowserService {
       if (atChooser) {
         steps.push('already authenticated with Cisco ID - at the account chooser, skipping the login form');
       } else {
+      // 0. The email FIRST. The sign-in page was redesigned (seen live
+      //    2026-08-24): it asks for the address on the Intersight page itself,
+      //    and "Sign In with Cisco ID" stays `disabled` until that box is
+      //    filled. Clicking first therefore could never work, and waiting for
+      //    the button to enable itself waited forever.
+      const emailSel = await this.firstVisible(page, CISCO_ID_EMAIL_SELECTORS, 8000);
+      if (emailSel) {
+        if (await this.typeField(page, emailSel, this.sso.username!)) {
+          steps.push('entered email on the Intersight sign-in page');
+        } else {
+          steps.push('could not fill the email box on the Intersight sign-in page');
+        }
+      } else {
+        // Not a failure: the older layout had no such box, and id.cisco.com
+        // asks for the address on its own page.
+        steps.push('no email box on the Intersight page (older layout) - going straight to Cisco ID');
+      }
+
       // 1. "Sign In with Cisco ID" on the Intersight landing page.
       const ciscoIdBtn = await this.firstVisible(
         page,
@@ -1005,8 +1024,10 @@ export class BrowserService {
           'input[name="identifier"]',
           '#okta-signin-username',
           'input#idp-discovery-username',
-          'input[name="username"]',
-          'input[name="email"]',
+          'input[name="username" i]',
+          // `i`, because the page uses name="Email" and CSS attribute values are
+          // case-sensitive - the reason this search used to miss it entirely.
+          'input[name="email" i]:not([name*="sso" i])',
           'input[type="email"]',
         ],
         20000

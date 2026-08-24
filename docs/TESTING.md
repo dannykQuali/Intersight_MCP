@@ -48,6 +48,7 @@ Each test file opens with the live failure it exists to prevent:
 | [recorderOcrText.test.ts](../test/recorderOcrText.test.ts) | A parked installer reading as a calm machine because only its words changed, not its pixels |
 | [frameOcrLifetime.test.ts](../test/frameOcrLifetime.test.ts) | A process that used OCR never exiting — which would break any background waiter, since its notification fires on exit |
 | [frameOcrAccuracy.test.ts](../test/frameOcrAccuracy.test.ts) | The real OCR engine regressing on dense console text, inventing text on a blank frame, or leaking browser chrome into the transcript |
+| [intersightLoginForm.test.ts](../test/intersightLoginForm.test.ts) | A redesigned sign-in page that asks for the email first, whose field the old selectors could not match (`name="Email"` vs `name="email"`) and whose second email box belongs to a different login |
 | [loginFailureClassification.test.ts](../test/loginFailureClassification.test.ts) | A lockout guard meant to protect an account disarming automatic login over failures that never sent a credential |
 | [loginButtonReady.test.ts](../test/loginButtonReady.test.ts) | Clicking "Sign In with Cisco ID" while it is still `disabled` under the page's loading overlay — Playwright cannot see a custom element's disabled attribute, so it burned a 30s click timeout and killed the login |
 | [consoleFocus.test.ts](../test/consoleFocus.test.ts) | Keyboard input being dispatched into page chrome because the shadow-DOM traversal never reached the console canvas |

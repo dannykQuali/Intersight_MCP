@@ -203,3 +203,35 @@ no credential was submitted, so this failure cannot lock the Cisco ID account
 and is not counted toward the auto-login lockout guard.
 ```
 
+## The sign-in page asks for the email first (redesign, 2026-08-24)
+
+The page changed shape and the flow was built for the old one. Captured live from
+a failure screenshot plus a shadow-DOM dump:
+
+```
+ucs-input            > … > input#input[name="Email"][type="text"]   <- fill THIS first
+ucs-button#submitButton  "Sign In with Cisco ID"                    <- disabled until it is filled
+---- Or ----
+ucs-input#ssoEmail   > … > input#input[name="sso-email"]            <- a DIFFERENT flow
+ucs-button               "Sign In with SSO"
+```
+
+Three faults followed from one change:
+
+1. **The button is disabled until the email is typed.** The flow clicked it first,
+   so the click could never land — and the operator saw a spinner on the button
+   while Playwright retried for 30 seconds.
+2. **The selectors missed the field.** It is `name="Email"` (capital E) with
+   `type="text"`; the flow looked for `name="email"` and `type="email"`. CSS
+   attribute values are case-sensitive, so neither matched — reported as
+   `Could not find the username field on the Cisco ID login page`, which points at
+   the wrong thing entirely. Selectors now carry the `i` flag.
+3. **There are two email boxes.** Typing a Cisco ID address into the SSO one
+   starts a different login, so the choice is deliberate
+   ([intersightLoginForm.ts](../src/utils/intersightLoginForm.ts)) and returns
+   nothing rather than guessing.
+
+Verified live: a daemon restarted on the fix reached `phase: active` with a live
+console in 83 seconds, first attempt, no login failures. The older single-field
+layout is still handled — a missing email box is a recorded step, not an error.
+

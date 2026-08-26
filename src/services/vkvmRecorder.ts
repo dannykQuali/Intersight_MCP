@@ -48,6 +48,12 @@ export interface RecordedFrame {
   space?: FrameSpace;
 }
 
+/** What the console is showing when it is not showing the server. */
+export interface NoSignalReading {
+  kind: 'inactivity' | 'dropped' | 'power-off' | 'unknown';
+  reason: string | null;
+}
+
 /** A frame is either the console canvas alone, or the whole tab with its chrome. */
 export type FrameSpace = 'canvas' | 'viewport';
 
@@ -62,6 +68,8 @@ export interface RecorderEvent {
     | 'vkvm-reset'
     | 'adopted-frames'
     | 'capture-mode'
+    | 'no-signal'
+    | 'signal-restored'
     | 'stopped';
   detail?: string;
 }
@@ -231,7 +239,12 @@ export interface RecorderHooks {
    * DEGRADED rather than dead — the client frequently reconnects on its own, so
    * the recorder only acts if it persists.
    */
-  isConsoleDisconnected?: (page: Page) => Promise<'inactivity' | 'dropped' | 'blanked-unknown' | null>;
+  /**
+   * The console's blank state and its reason, or null when healthy. The reason is
+   * carried so it can be recorded as metadata: relying on the frame's pixels left
+   * no trace of a blank console in the timeline, and none at all when OCR failed.
+   */
+  isConsoleDisconnected?: (page: Page) => Promise<NoSignalReading | null>;
   /**
    * Wake a console asleep from user inactivity (sends a harmless key). Relaunching
    * does NOT fix that state; the screen asks for a keypress.
@@ -764,13 +777,15 @@ export class VkvmRecorder {
         // few checks to reconnect by itself before relaunching, but do not wait
         // for the terminal dialog - that cost ~2 minutes of blindness live.
         if (this.hooks.isConsoleDisconnected) {
-          const state = await this.hooks.isConsoleDisconnected(this.page).catch(() => null);
+          const reading = await this.hooks.isConsoleDisconnected(this.page).catch(() => null);
+          this.noteSignalState(reading);
+          const state = reading?.kind ?? null;
           // 'blanked-unknown' is treated exactly like inactivity: the screen IS a
           // placeholder (proved by pixels) and a bare modifier is free to try.
           // Requiring a readable reason first is what let a broken OCR engine
           // disable waking entirely — a live recorder reported wakes: 0 across 28
           // hours while its console sat green for minutes at a time.
-          if (state === 'inactivity' || state === 'blanked-unknown') {
+          if (state === 'inactivity' || state === 'unknown') {
             // The host video is asleep, not disconnected. Relaunching would not
             // help; send the keypress the screen is asking for.
             this.disconnectedStreak = 0;
@@ -1314,6 +1329,38 @@ export class VkvmRecorder {
     }
   }
 
+  /**
+   * Record when the console went blank and when it came back.
+   *
+   * The picture used to be the only record. Nothing in the timeline said the
+   * console was green between 02:00 and 02:04, so reviewing a night meant opening
+   * frames to find out — and when OCR failed for 570 frames straight on a live
+   * recorder, the reason was lost completely. One event per TRANSITION: a console
+   * can sit blank for minutes, and an event per check would bury the timeline.
+   */
+  private noteSignalState(reading: NoSignalReading | null): void {
+    const key = reading ? `${reading.kind}:${reading.reason ?? ''}` : null;
+    if (key === this.noSignalKey) {
+      return;
+    }
+    if (reading) {
+      this.noSignalSince = Date.now();
+      this.noSignal = reading;
+      this.addEvent('no-signal', `console is blank (${reading.kind})${reading.reason ? `: ${reading.reason}` : ''}`);
+    } else {
+      const wasBlankFor = this.noSignalSince ? Math.round((Date.now() - this.noSignalSince) / 1000) : null;
+      this.noSignal = null;
+      this.noSignalSince = null;
+      this.addEvent('signal-restored', wasBlankFor === null ? 'console is showing the server again' : `console is showing the server again after ${wasBlankFor}s blank`);
+    }
+    this.noSignalKey = key;
+    this.publishState();
+  }
+
+  private noSignal: NoSignalReading | null = null;
+  private noSignalSince: number | null = null;
+  private noSignalKey: string | null = null;
+
   /** Every retained frame, oldest first. A copy, so callers cannot mutate the buffer. */
   allFrames(): RecordedFrame[] {
     return [...this.frames];
@@ -1506,6 +1553,19 @@ export class VkvmRecorder {
               `byte-identical to the frame already stored — a powered-off or parked console is recorded once, ` +
               `then anchored every ${Math.round(this.opts.identicalHeartbeatSeconds / 60)} minutes instead of every ` +
               `${this.opts.heartbeatSeconds}s. Any real change is still captured on the tick it happens.`,
+          }
+        : {}),
+      ...(this.noSignal
+        ? {
+            noSignal: {
+              kind: this.noSignal.kind,
+              reason: this.noSignal.reason,
+              since: new Date(this.noSignalSince ?? Date.now()).toISOString(),
+              seconds: Math.round((Date.now() - (this.noSignalSince ?? Date.now())) / 1000),
+              note:
+                'The console is showing the BMC placeholder, not the server. This is reported here as well as being ' +
+                'visible in the frames, so a blank console is still discoverable when OCR cannot read it.',
+            },
           }
         : {}),
       capture: {

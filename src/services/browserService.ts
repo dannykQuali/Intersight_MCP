@@ -39,7 +39,9 @@ import {
   NoSignalState,
   NO_SIGNAL_GREEN_THRESHOLD,
 } from './consoleSignals.js';
-import { fromScaledFrame } from '../utils/frameCoords.js';
+import { canvasPointToViewport, fromScaledFrame, type CanvasGeometry } from '../utils/frameCoords.js';
+import type { NoSignalReading } from './vkvmRecorder.js';
+import { consoleCanvasGeometryPageScript } from '../utils/consoleCanvasCapture.js';
 import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
 import { lockoutExemptionReason } from '../utils/loginFailureClassification.js';
@@ -1522,18 +1524,16 @@ export class BrowserService {
    * which is what finally triggered recovery. Detecting the green state
    * directly cuts that dead time.
    */
-  private async isConsoleDisconnected(page: Page): Promise<'inactivity' | 'dropped' | 'blanked-unknown' | null> {
+  private async isConsoleDisconnected(page: Page): Promise<NoSignalReading | null> {
     const state = await this.consoleNoSignal(page);
-    if (state.kind === 'dropped') {
-      return 'dropped';
+    if (!state.blanked) {
+      return null;
     }
-    // A blank screen whose reason could not be read is still worth a keypress —
-    // see shouldWakeBlankedConsole. Reported separately so the recorder's event
-    // log says which of the two it acted on.
-    if (shouldWakeBlankedConsole(state)) {
-      return state.kind === 'inactivity' ? 'inactivity' : 'blanked-unknown';
-    }
-    return null;
+    // Every blank state is reported now, including power-off, which needs no
+    // remedy but must still appear in the record: a recorder was once observed
+    // sitting on it for hours while its status looked healthy. What to DO about
+    // each one stays with the recorder (see shouldWakeBlankedConsole).
+    return { kind: state.kind ?? 'unknown', reason: state.reason };
   }
 
   /**
@@ -2708,13 +2708,24 @@ export class BrowserService {
       // out. An explicit relativeTo always wins.
       const framesAreCanvas = this.recorders.get(opts.serverMoid ?? '')?.frameSpace() === 'canvas';
       const relativeTo = opts.relativeTo ?? (framesAreCanvas ? 'canvas' : undefined);
+      let canvasMapping: { scaleX: number; scaleY: number } | null = null;
       if (relativeTo === 'canvas') {
-        const box = await page.locator('canvas').first().boundingBox().catch(() => null);
-        if (box) {
-          x += box.x;
-          y += box.y;
-          canvasOffsetApplied = true;
-        }
+        // A canvas frame is in the canvas's BACKING STORE (the server's own
+        // resolution), while the pointer lives in CSS pixels. The two differ by an
+        // offset AND a ratio; only the offset used to be applied. Measured live:
+        // 1024x768 backing displayed at 1011x758, so 13px of error at the right
+        // edge - and a 1920x1080 console in the same box would be ~900px out.
+        //
+        // The canvas is located exactly as the capture locates it, so a click and
+        // the frame it was read from cannot disagree about which canvas is meant.
+        const geometry = (await page
+          .evaluate(consoleCanvasGeometryPageScript())
+          .catch(() => null)) as CanvasGeometry | null;
+        const mapped = canvasPointToViewport(x, y, geometry ?? { box: null, backing: { width: 0, height: 0 } });
+        x = mapped.x;
+        y = mapped.y;
+        canvasOffsetApplied = mapped.applied;
+        canvasMapping = mapped.applied ? { scaleX: mapped.scaleX, scaleY: mapped.scaleY } : null;
       }
       const button = opts.button ?? 'left';
       switch (opts.action ?? 'click') {
@@ -2741,6 +2752,16 @@ export class BrowserService {
         y,
         button,
         canvasOffsetApplied,
+        ...(canvasMapping
+          ? {
+              canvasMapping: {
+                ...canvasMapping,
+                note:
+                  'Frame coordinates were scaled from the resolution of the console canvas into page pixels and ' +
+                  'offset to where the canvas sits.',
+              },
+            }
+          : {}),
         ...(opts.relativeTo === undefined && relativeTo === 'canvas'
           ? {
               relativeToApplied:

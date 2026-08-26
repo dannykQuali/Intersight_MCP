@@ -169,3 +169,43 @@ export function consoleCanvasCapturePageScript(): string {
   }
 })()`;
 }
+
+/**
+ * Read the console canvas's geometry: where it sits, and its backing-store size.
+ *
+ * Finds the canvas by exactly the same rule the capture uses, so a click and the
+ * frame it was read from can never disagree about which canvas is meant. Both
+ * numbers are needed because a canvas frame is in the backing store while the
+ * pointer is in CSS pixels, and the two differ by a ratio as well as an offset.
+ */
+export function consoleCanvasGeometryPageScript(): string {
+  return `(() => {
+  try {
+    const seen = new Set();
+    let found = null;
+    const walk = (root, depth) => {
+      if (!root || depth > 12 || seen.has(root) || found) return;
+      seen.add(root);
+      const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+      for (const el of all) {
+        if (el.tagName === 'CANVAS') {
+          if (el.id === 'kvmCanvas') { found = el; return; }
+          if (el.width >= 320 && el.height >= 240 && (!found || el.width * el.height > found.width * found.height)) {
+            found = el;
+          }
+        }
+        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+      }
+    };
+    walk(document.body, 0);
+    if (!found) return { box: null, backing: { width: 0, height: 0 } };
+    const r = found.getBoundingClientRect();
+    return {
+      box: { x: r.x, y: r.y, width: r.width, height: r.height },
+      backing: { width: found.width, height: found.height },
+    };
+  } catch (e) {
+    return { box: null, backing: { width: 0, height: 0 } };
+  }
+})()`;
+}

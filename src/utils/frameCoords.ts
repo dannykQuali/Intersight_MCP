@@ -41,3 +41,51 @@ export function fromScaledFrame(x: number, y: number, scale?: number): { x: numb
   }
   return { x: Math.round(x / scale), y: Math.round(y / scale) };
 }
+
+/** Where a canvas sits on the page, and how big its backing store is. */
+export interface CanvasGeometry {
+  /** The canvas's position and displayed size in CSS pixels; null if unknown. */
+  box: { x: number; y: number; width: number; height: number } | null;
+  /** The canvas's own pixel dimensions — the space a canvas frame is in. */
+  backing: { width: number; height: number };
+}
+
+export interface MappedPoint {
+  x: number;
+  y: number;
+  /** The ratio applied on each axis, for reporting. 1 = none. */
+  scaleX: number;
+  scaleY: number;
+  /** False when there was no canvas box, so the point was left alone. */
+  applied: boolean;
+}
+
+/**
+ * Turn a point read off a CANVAS frame into a viewport point.
+ *
+ * A canvas frame is in the canvas's backing store — the server's own resolution —
+ * while the pointer lives in CSS pixels on the page. The two differ by both an
+ * offset AND a ratio, and only the offset used to be applied. Measured live:
+ * backing 1024x768 displayed at 1011x758 (ratio 0.987), which is 13px of error at
+ * the right edge. The ratio is set by the window size against the server's video
+ * mode, so it is not always near 1: a 1920x1080 console in the same 1011px-wide
+ * box gives 0.53, and a click meant for x=1900 would land ~900px away.
+ *
+ * Degrades rather than throwing: an unknown backing size skips the ratio (an
+ * offset is still better than nothing), and a missing box leaves the point alone.
+ */
+export function canvasPointToViewport(x: number, y: number, geometry: CanvasGeometry): MappedPoint {
+  const { box, backing } = geometry;
+  if (!box) {
+    return { x: Math.round(x), y: Math.round(y), scaleX: 1, scaleY: 1, applied: false };
+  }
+  const scaleX = backing.width > 0 ? box.width / backing.width : 1;
+  const scaleY = backing.height > 0 ? box.height / backing.height : 1;
+  return {
+    x: Math.round(box.x + x * scaleX),
+    y: Math.round(box.y + y * scaleY),
+    scaleX,
+    scaleY,
+    applied: true,
+  };
+}

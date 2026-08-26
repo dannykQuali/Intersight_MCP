@@ -31,6 +31,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 import { movingMarkFrame } from './helpers/fakeConsolePage.js';
 import {
+  consoleCanvasGeometryPageScript,
   consoleCanvasCapturePageScript,
   decodeCanvasCapture,
   MIN_CAPTURE_BYTES,
@@ -135,5 +136,30 @@ describe('the in-page capture script', () => {
   it('never throws out of the page, because a throw would look like a dead console', () => {
     const script = consoleCanvasCapturePageScript();
     assert.match(script, /try|catch/);
+  });
+});
+
+describe('the canvas geometry probe', () => {
+  it('parses and reports both the box and the backing store', () => {
+    // Both are required: a canvas frame is in the backing store, the pointer is in
+    // CSS pixels, and they differ by a ratio as well as an offset.
+    const script = consoleCanvasGeometryPageScript();
+    assert.doesNotThrow(() => new Function(`return ${script}`));
+    assert.match(script, /getBoundingClientRect/);
+    assert.match(script, /backing/);
+  });
+
+  it('finds the canvas by the same rule as the capture', () => {
+    // If the click and the capture ever picked different canvases, every
+    // coordinate would be silently wrong.
+    const capture = consoleCanvasCapturePageScript();
+    const geometry = consoleCanvasGeometryPageScript();
+    for (const rule of ['kvmCanvas', 'shadowRoot', '320', '240']) {
+      assert.ok(capture.includes(rule) && geometry.includes(rule), `both must share the rule: ${rule}`);
+    }
+  });
+
+  it('reports an unknown geometry rather than throwing', () => {
+    assert.match(consoleCanvasGeometryPageScript(), /box: null/);
   });
 });

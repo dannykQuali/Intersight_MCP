@@ -136,7 +136,12 @@ export class FrameOcr {
    * top-to-bottom, left-to-right. Lines are banded into rows (a console line is
    * ~16-22px tall) and sorted within each band.
    */
-  private linesToText(result: unknown): string {
+  /**
+   * @param chromeFilter drop lines that sit where the client's navigation and top
+   * bar live. Correct for a full-tab screenshot; WRONG for a canvas-only frame,
+   * where a shell prompt at the left edge would be thrown away as furniture.
+   */
+  private linesToText(result: unknown, chromeFilter = true): string {
     const items = (Array.isArray(result) ? result : []) as DetectedLine[];
     const kept = items.filter((l) => {
       if (!l || typeof l.text !== 'string' || !Array.isArray(l.box)) {
@@ -148,7 +153,7 @@ export class FrameOcr {
       const xs = l.box.map((p) => p[0]);
       const ys = l.box.map((p) => p[1]);
       // Entirely within the nav column or the top bar: chrome, not console.
-      if (Math.max(...xs) < NAV_EDGE_X || Math.max(...ys) < TOP_BAR_Y) {
+      if (chromeFilter && (Math.max(...xs) < NAV_EDGE_X || Math.max(...ys) < TOP_BAR_Y)) {
         return false;
       }
       return true;
@@ -171,8 +176,9 @@ export class FrameOcr {
   }
 
   /** Recognised text for a frame, or null if OCR is unavailable/failed. */
-  async textOf(framePath: string): Promise<string | null> {
-    const cached = this.cache.get(framePath);
+  async textOf(framePath: string, opts: { chromeFilter?: boolean } = {}): Promise<string | null> {
+    const cacheKey = `${framePath}|${opts.chromeFilter === false ? 'raw' : 'chrome'}`;
+    const cached = this.cache.get(cacheKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -185,12 +191,12 @@ export class FrameOcr {
       // path styles (observed with POSIX-style paths on Windows), and the
       // recorder already knows the file exists.
       const buf = await fs.promises.readFile(framePath);
-      const text = this.linesToText(await engine.detect(buf));
+      const text = this.linesToText(await engine.detect(buf), opts.chromeFilter ?? true);
       // Bound the cache; frames age out of the ring buffer anyway.
       if (this.cache.size > 500) {
         this.cache.clear();
       }
-      this.cache.set(framePath, text);
+      this.cache.set(cacheKey, text);
       this.consecutiveDetectFailures = 0;
       return text;
     } catch (error) {
@@ -201,13 +207,13 @@ export class FrameOcr {
   }
 
   /** Recognise straight from an in-memory PNG (no cache — buffers are one-off). */
-  async textOfBuffer(buf: Buffer): Promise<string | null> {
+  async textOfBuffer(buf: Buffer, opts: { chromeFilter?: boolean } = {}): Promise<string | null> {
     const engine = await this.getEngine();
     if (!engine) {
       return null;
     }
     try {
-      const text = this.linesToText(await engine.detect(buf));
+      const text = this.linesToText(await engine.detect(buf), opts.chromeFilter ?? true);
       this.consecutiveDetectFailures = 0;
       return text;
     } catch (error) {

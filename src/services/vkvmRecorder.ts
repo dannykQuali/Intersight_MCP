@@ -27,6 +27,7 @@ import { PNG } from 'pngjs';
 import type { Page } from 'playwright-core';
 import { writeRecorderState } from './recorderState.js';
 import { TileTracker } from './tileNovelty.js';
+import { consoleCanvasCapturePageScript, decodeCanvasCapture } from '../utils/consoleCanvasCapture.js';
 
 export interface RecordedFrame {
   seq: number;
@@ -38,7 +39,17 @@ export interface RecordedFrame {
   changeRatio: number;
   /** 'adopted' = inherited from a previous recorder's files, so its change ratio is unknown. */
   reason: 'first' | 'change' | 'heartbeat' | 'adopted';
+  /**
+   * Which space this frame is in. Recorded PER FRAME because a run can switch
+   * once (the console canvas is not sized for the first second or so), and
+   * reading a viewport frame as if it were canvas-only makes OCR drop any text
+   * near the left edge as though it were navigation furniture.
+   */
+  space?: FrameSpace;
 }
+
+/** A frame is either the console canvas alone, or the whole tab with its chrome. */
+export type FrameSpace = 'canvas' | 'viewport';
 
 /** A notable non-frame occurrence (console death, recovery), for the timeline. */
 export interface RecorderEvent {
@@ -50,6 +61,7 @@ export interface RecorderEvent {
     | 'recovery-failed'
     | 'vkvm-reset'
     | 'adopted-frames'
+    | 'capture-mode'
     | 'stopped';
   detail?: string;
 }
@@ -91,6 +103,14 @@ export interface NudgeDecision {
  * outright (its tile only ever returns to a known state).
  */
 export const STILL_SAMPLES_BEFORE_NUDGE = 3;
+
+/**
+ * Canvas reads allowed before giving up and screenshotting instead.
+ *
+ * The console canvas is unsized (300x150) for the first tick or two after launch,
+ * so a single miss means nothing. About a minute at the default 1 Hz.
+ */
+const CANVAS_WARMUP_ATTEMPTS = 60;
 
 /** Console text transcript, one JSON line per text change, beside the frames. */
 export const OCR_TEXT_FILENAME = 'text.jsonl';
@@ -223,7 +243,11 @@ export interface RecorderHooks {
    * Supplied by BrowserService so every recorder shares ONE OCR worker rather
    * than each loading its own copy of the recognition models.
    */
-  ocrFrame?: (framePath: string) => Promise<string | null>;
+  /**
+   * Read a frame's text. `space` is the frame's own space, so a viewport frame
+   * recorded during canvas warm-up is still chrome-filtered correctly.
+   */
+  ocrFrame?: (framePath: string, space?: FrameSpace) => Promise<string | null>;
   /** Re-establish the console (re-login + relaunch) and return the new page. */
   recover?: () => Promise<Page | null>;
   /**
@@ -790,7 +814,7 @@ export class VkvmRecorder {
         }
       }
       // No bringToFront() - see class docs.
-      const buf = await this.page.screenshot({ timeout: 15000 });
+      const { buf, space } = await this.grabFrame();
       this.consecutiveCaptureErrors = 0;
       const hash = crypto.createHash('sha1').update(buf).digest('hex');
       const now = Date.now();
@@ -813,7 +837,7 @@ export class VkvmRecorder {
           if (hash === this.lastStoredHash && now - this.lastStoredAt < this.opts.identicalHeartbeatSeconds * 1000) {
             this.heartbeatsSuppressed++;
           } else {
-            this.store(buf, now, 0, 'heartbeat');
+            this.store(buf, now, 0, 'heartbeat', space);
           }
         }
       } else {
@@ -842,15 +866,15 @@ export class VkvmRecorder {
           this.lastPng = png;
 
           if (this.frames.length === 0) {
-            this.store(buf, now, 0, 'first');
+            this.store(buf, now, 0, 'first', space);
           } else if (novelty.novelTiles > 0) {
-            this.store(buf, now, ratio, 'change');
+            this.store(buf, now, ratio, 'change', space);
             this.lastNoveltyAt = now;
           } else if (heartbeatDue) {
             // Blink- or rhythm-only churn: kept visible via the heartbeat, so
             // a clock or spinner still appears in the record about once a
             // minute without flooding it.
-            this.store(buf, now, ratio, 'heartbeat');
+            this.store(buf, now, ratio, 'heartbeat', space);
           }
         }
         // an undecodable grab is skipped, never stored as garbage
@@ -984,6 +1008,8 @@ export class VkvmRecorder {
           bytes: stat.size,
           changeRatio: 0,
           reason: 'adopted',
+          // Unknown: written by a previous run, possibly in the other space.
+          space: undefined,
         });
       } catch {
         // Vanished between listing and stat: nothing to adopt.
@@ -1004,7 +1030,80 @@ export class VkvmRecorder {
     }
   }
 
-  private store(buf: Buffer, at: number, changeRatio: number, reason: RecordedFrame['reason']): void {
+  /**
+   * Get one frame, preferring the canvas over a tab screenshot.
+   *
+   * Screenshotting the tab is what turned this recorder into a security defect:
+   * in headful Chromium a capture makes the browser hold a Windows
+   * DisplayRequired power request (holder `msedge.exe`, reason `Capturing`), and
+   * with two or three recorders running the request never lets go, so the machine
+   * cannot auto-lock. Reading the canvas's own backing store gets the same pixels
+   * with no capture path at all. See docs/RECORDER_DISPLAY_POWER_REQUEST.md.
+   *
+   * The mode is decided ONCE and then kept: a frame stream that silently changed
+   * coordinate space or gained chrome halfway through would quietly corrupt both
+   * the OCR chrome filter and any mouse coordinate derived from a frame.
+   */
+  private async grabFrame(): Promise<{ buf: Buffer; space: FrameSpace }> {
+    const canCapture =
+      this.captureSpace !== 'viewport' && typeof (this.page as { evaluate?: unknown }).evaluate === 'function';
+    if (canCapture) {
+      const decoded = decodeCanvasCapture(
+        await this.page.evaluate(consoleCanvasCapturePageScript()).catch((e: Error) => ({
+          ok: false,
+          reason: `evaluate failed: ${e.message.slice(0, 100)}`,
+        }))
+      );
+      if ('png' in decoded) {
+        if (this.captureSpace !== 'canvas') {
+          this.captureSpace = 'canvas';
+          this.canvasSize = { width: decoded.width, height: decoded.height };
+          this.addEvent('capture-mode', `reading the console canvas directly (${decoded.width}x${decoded.height})`);
+        }
+        return { buf: decoded.png, space: 'canvas' };
+      }
+      // 'notReady' is the console canvas existing but not yet sized or painted —
+      // seen live one second after launch, at the HTML default 300x150. Retrying
+      // through a warm-up window is right; giving up permanently on the first tick
+      // would abandon the fix for the whole run.
+      if ('notReady' in decoded && this.canvasWarmupAttempts < CANVAS_WARMUP_ATTEMPTS) {
+        this.canvasWarmupAttempts++;
+        this.captureNotReadyReason = decoded.notReady;
+      } else {
+        const why = 'notReady' in decoded ? decoded.notReady : decoded.error;
+        this.captureSpace = 'viewport';
+        this.captureDowngradeReason = why;
+        this.addEvent('capture-mode', `falling back to tab screenshots: ${why}`);
+      }
+    } else if (this.captureSpace === 'unknown') {
+      // No evaluate available (a fake page in tests): nothing worth reporting.
+      this.captureSpace = 'viewport';
+    }
+    return { buf: await this.page.screenshot({ timeout: 15000 }), space: 'viewport' };
+  }
+
+  /**
+   * Which space frames are in. 'canvas' frames are the server's screen alone;
+   * 'viewport' frames include the client's chrome.
+   */
+  private captureSpace: 'unknown' | FrameSpace = 'unknown';
+  private canvasSize: { width: number; height: number } | null = null;
+  private captureDowngradeReason: string | null = null;
+  private captureNotReadyReason: string | null = null;
+  private canvasWarmupAttempts = 0;
+
+  /** Public so BrowserService can map mouse coordinates and OCR can filter. */
+  frameSpace(): 'canvas' | 'viewport' | 'unknown' {
+    return this.captureSpace;
+  }
+
+  private store(
+    buf: Buffer,
+    at: number,
+    changeRatio: number,
+    reason: RecordedFrame['reason'],
+    space: FrameSpace = 'viewport'
+  ): void {
     const seq = ++this.seq;
     const file = path.join(this.dir, `f-${String(seq).padStart(6, '0')}.png`);
     try {
@@ -1019,6 +1118,7 @@ export class VkvmRecorder {
       bytes: buf.length,
       changeRatio: Math.round(changeRatio * 10000) / 10000,
       reason,
+      space,
     });
     this.lastStoredAt = at;
     this.lastStoredHash = crypto.createHash('sha1').update(buf).digest('hex');
@@ -1075,7 +1175,7 @@ export class VkvmRecorder {
           // settle. An unbounded await here would park the queue permanently -
           // no transcript, no text signal, and no error - leaving the recorder
           // looking healthy while its most useful signal silently stopped.
-          raw = await this.withOcrTimeout(this.hooks.ocrFrame(frame.path));
+          raw = await this.withOcrTimeout(this.hooks.ocrFrame(frame.path, frame.space));
         } catch {
           this.ocrFailures++;
           continue;
@@ -1408,6 +1508,20 @@ export class VkvmRecorder {
               `${this.opts.heartbeatSeconds}s. Any real change is still captured on the tick it happens.`,
           }
         : {}),
+      capture: {
+        space: this.captureSpace,
+        ...(this.captureNotReadyReason && this.captureSpace === 'unknown'
+          ? { waitingForCanvas: this.captureNotReadyReason, attempts: this.canvasWarmupAttempts }
+          : {}),
+        ...(this.canvasSize ? { canvas: `${this.canvasSize.width}x${this.canvasSize.height}` } : {}),
+        ...(this.captureDowngradeReason ? { fellBackBecause: this.captureDowngradeReason } : {}),
+        note:
+          this.captureSpace === 'canvas'
+            ? 'Frames are the console canvas itself, so they carry no client chrome and their coordinates are ' +
+              'canvas-relative - send mouse input with relativeTo:"canvas". Read this way because screenshotting ' +
+              'the tab makes the browser hold a Windows display power request, which stops the machine locking.'
+            : 'Frames are full-tab screenshots, including the client chrome; coordinates are viewport-relative.',
+      },
       framesEvicted: this.framesEvicted,
       framesAdopted: this.framesAdopted,
       ...(this.framesAdopted > 0

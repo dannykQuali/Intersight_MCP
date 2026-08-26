@@ -2702,7 +2702,13 @@ export class BrowserService {
       let y = scaled.y;
       const scaleApplied = x !== Math.round(opts.x) || y !== Math.round(opts.y);
       let canvasOffsetApplied = false;
-      if (opts.relativeTo === 'canvas') {
+      // Recorded frames are the canvas itself now, so a coordinate read off one is
+      // canvas-relative. Defaulted rather than required, because every caller
+      // reading coordinates from vkvm_recent would otherwise be silently 200-400px
+      // out. An explicit relativeTo always wins.
+      const framesAreCanvas = this.recorders.get(opts.serverMoid ?? '')?.frameSpace() === 'canvas';
+      const relativeTo = opts.relativeTo ?? (framesAreCanvas ? 'canvas' : undefined);
+      if (relativeTo === 'canvas') {
         const box = await page.locator('canvas').first().boundingBox().catch(() => null);
         if (box) {
           x += box.x;
@@ -2735,6 +2741,13 @@ export class BrowserService {
         y,
         button,
         canvasOffsetApplied,
+        ...(opts.relativeTo === undefined && relativeTo === 'canvas'
+          ? {
+              relativeToApplied:
+                'canvas (defaulted, because this recorder captures the console canvas itself, so frame coordinates ' +
+                'are canvas-relative)',
+            }
+          : {}),
         ...(scaleApplied ? { fromScale: opts.fromScale, requested: { x: opts.x, y: opts.y } } : {}),
         ...target,
         url: page.url(),
@@ -3098,7 +3111,15 @@ export class BrowserService {
       // A console asleep from user inactivity needs a KEY, not a relaunch.
       wakeConsole: () => this.wakeConsole(serverMoid),
       // One shared OCR worker across every recorder, not one each.
-      ocrFrame: (framePath) => this.frameOcr.textOf(framePath),
+      // A canvas frame has no chrome to filter; filtering it would discard a
+      // prompt sitting at the left edge.
+      // Filter chrome only for frames that HAVE chrome. The space travels with the
+      // frame, so a viewport frame recorded during canvas warm-up is still read
+      // correctly after the recorder has switched to canvas capture.
+      ocrFrame: (framePath, space) =>
+        this.frameOcr.textOf(framePath, {
+          chromeFilter: (space ?? this.recorders.get(serverMoid)?.frameSpace()) !== 'canvas',
+        }),
       ocrHealth: () => this.frameOcr.health(),
       // Input the agent sent counts as activity, so the nudge does not pile on top.
       lastAgentInputAt: () => this.agentInput.lastInputAtFor(serverMoid),
@@ -3281,12 +3302,22 @@ export class BrowserService {
           `${st.nextRecoveryAttemptAt ? `, next attempt ${st.nextRecoveryAttemptAt}` : ''}.` +
           ` Frames below may predate the outage and do NOT reflect the machine now.` +
           ` Recent events: ${JSON.stringify(st.recentEvents.slice(-3))}`;
+    // Say so where coordinates are actually read: these frames ARE the console
+    // canvas, so a coordinate off one is canvas-relative. browser_mouse defaults
+    // to relativeTo:'canvas' for this recorder, but a caller doing its own maths
+    // needs to know.
+    const canvasSpaceNote =
+      this.recorders.get(serverMoid)?.frameSpace() === 'canvas'
+        ? ' These frames are the console canvas itself (no client chrome), so coordinates are canvas-relative;' +
+          ' browser_mouse already defaults to relativeTo:"canvas" here.'
+        : '';
     const header =
       `Last ${frames.length} recorded console frame(s) for ${serverMoid}, oldest first` +
       `${changesOnly ? ' (changes only)' : ''}, scale=${scale}. ` +
       `${missed} change frame(s) had occurred since your previous look. ` +
       `Last frame is ${st.secondsSinceLastFrame}s old. ` +
       `Use vkvm_timeline for a cheap text history, or vkvm_frames_at to inspect a specific moment at full resolution.` +
+      canvasSpaceNote +
       warning;
     return { __mcpContent: this.framesToContent(frames, scale, header) };
   }

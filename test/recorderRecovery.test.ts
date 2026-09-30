@@ -105,6 +105,56 @@ describe('VkvmRecorder recovery escalation', () => {
     assert.equal(counts.relaunches, relaunchesAtGiveUp, 'no further relaunches while backing off');
   });
 
+  it('does not spend the reset budget on resets that never ran', async () => {
+    // Regression (CHGLAB-UCSX-1-5-1, 2026-09-30): the browser session had
+    // expired, so both escalations failed at the ServerSettings lookup before
+    // any PATCH was sent - yet each was counted as a reset. With the budget
+    // "spent", every later attempt ended in "the server needs attention"
+    // without the reset ever having been applied once.
+    const counts = { relaunches: 0, resetCalls: 0, resetsApplied: 0 };
+    const recorder = new VkvmRecorder(
+      new FakeConsolePage().asPage(),
+      tempDir(),
+      {
+        intervalMs: 250,
+        deadCheckEveryTicks: 1,
+        antiBlankSeconds: 0,
+        heartbeatSeconds: 3600,
+        recoveryBackoffMs: 50,
+      },
+      {
+        isConsoleDead: async () => true,
+        recover: async () => {
+          counts.relaunches++;
+          return new FakeConsolePage().asPage();
+        },
+        resetTunneledVkvm: async () => {
+          counts.resetCalls++;
+          if (counts.resetCalls <= 2) {
+            throw new Error('ServerSettings lookup failed: HTTP 401 (the browser session is not logged in)');
+          }
+          counts.resetsApplied++;
+        },
+      }
+    );
+    recorders.push(recorder);
+    recorder.start();
+
+    await waitFor(() => counts.resetsApplied >= 1, 20000, 'a reset to be applied once the session is back');
+
+    const status = recorder.status();
+    assert.ok(status.tunneledVkvmResets >= 1, 'an applied reset is counted');
+    assert.ok(
+      status.tunneledVkvmResets <= counts.resetsApplied,
+      `only applied resets may be counted (counted ${status.tunneledVkvmResets}, applied ${counts.resetsApplied})`
+    );
+    const failures = status.recentEvents.filter((e: any) => e.kind === 'recovery-failed');
+    assert.ok(
+      failures.some((e: any) => /401/.test(e.detail ?? '')),
+      'the real cause of a failed reset must reach the timeline'
+    );
+  });
+
   it('does not escalate when each recovered console survives', async () => {
     // shortLivedRecoveryMs=1 means every console counts as long-lived, i.e. a
     // console dying hours apart all night - normal, not the Intersight bug.

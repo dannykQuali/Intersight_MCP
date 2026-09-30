@@ -2950,7 +2950,16 @@ export class BrowserService {
       'GET',
       `/api/v1/compute/ServerSettings?$filter=Server.Moid eq '${serverMoid}'&$select=Moid`
     );
-    const settingMoid = settings.ok ? settings.body?.Results?.[0]?.Moid : null;
+    // A failed request is NOT "no setting": reporting it as one (2026-09-30, an
+    // expired browser session) read like a wrong filter for blades. The filter
+    // is fine for both compute.Blade and compute.RackUnit.
+    if (!settings.ok) {
+      throw new Error(
+        `ServerSettings lookup for ${serverMoid} failed: HTTP ${settings.status}` +
+          (settings.status === 401 || settings.status === 403 ? ' (is the browser session still logged in?)' : '')
+      );
+    }
+    const settingMoid = settings.body?.Results?.[0]?.Moid;
     if (!settingMoid) {
       throw new Error(`no compute.ServerSetting found for server ${serverMoid}`);
     }

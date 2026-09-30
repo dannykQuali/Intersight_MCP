@@ -333,6 +333,12 @@ export interface RecorderOptions {
    */
   shortLivedRecoveryMs?: number;
   /**
+   * First step of the backoff ladder after a failed recovery; each further
+   * failure doubles it, capped at 5 minutes. Default 30000ms. Exposed mainly so
+   * tests can compress the timings.
+   */
+  recoveryBackoffMs?: number;
+  /**
    * Recognise the text of every stored frame into a transcript beside them
    * (default true when an OCR hook is available).
    *
@@ -496,6 +502,7 @@ export class VkvmRecorder {
       antiBlankSeconds: opts?.antiBlankSeconds ?? 240,
       antiBlankMode: opts?.antiBlankMode ?? 'mouse',
       shortLivedRecoveryMs: Math.max(1, opts?.shortLivedRecoveryMs ?? 60000),
+      recoveryBackoffMs: Math.max(1, opts?.recoveryBackoffMs ?? 30000),
       ocrText: opts?.ocrText ?? true,
       ocrTimeoutMs: Math.max(100, opts?.ocrTimeoutMs ?? 30000),
     };
@@ -690,7 +697,7 @@ export class VkvmRecorder {
       this.recoveryFailures++;
       // 30s, 60s, 120s ... capped at 5 minutes. Keeps trying all night without
       // hammering (the login circuit breaker separately guards the account).
-      const backoff = Math.min(300000, 30000 * 2 ** (this.recoveryFailures - 1));
+      const backoff = Math.min(300000, this.opts.recoveryBackoffMs * 2 ** (this.recoveryFailures - 1));
       this.nextRecoveryAt = Date.now() + backoff;
       this.state = 'failed';
       this.addEvent(
@@ -723,11 +730,10 @@ export class VkvmRecorder {
           `Tunneled vKVM reset(s) - the server needs attention`
       );
     }
-    this.tunneledResets++;
     this.addEvent(
       'vkvm-reset',
       `console died within ${windowSec}s of ${this.shortLivedRecoveries} relaunches in a row; ` +
-        `disabling and re-enabling Tunneled vKVM (reset ${this.tunneledResets}/${VkvmRecorder.MAX_TUNNELED_RESETS})`
+        `disabling and re-enabling Tunneled vKVM (reset ${this.tunneledResets + 1}/${VkvmRecorder.MAX_TUNNELED_RESETS})`
     );
     let timer: NodeJS.Timeout | undefined;
     try {
@@ -741,11 +747,18 @@ export class VkvmRecorder {
           timer.unref?.();
         }),
       ]);
+    } catch (error) {
+      // Not counted: a reset that failed (typically at the ServerSettings
+      // lookup, because the browser session had expired) proved nothing about
+      // the server. Counting it spent the whole budget on 2026-09-30 without a
+      // single PATCH being sent. The backoff ladder paces the next try.
+      throw new Error(`Tunneled vKVM reset not applied (not counted): ${(error as Error).message}`);
     } finally {
       if (timer) {
         clearTimeout(timer);
       }
     }
+    this.tunneledResets++;
     // Give the reset a fair chance: judge the next console on its own merits.
     this.shortLivedRecoveries = 0;
   }

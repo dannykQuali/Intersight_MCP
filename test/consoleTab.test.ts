@@ -129,7 +129,8 @@ describe('openConsoleTab', () => {
     const world = new FakeContext();
     world.pagesList.push(new FakePage(`${ORIGIN}/an/home`, world, 'refused'));
 
-    const opened = await openConsoleTab(world.asContext(), clientUrl);
+    // Short popup wait: the waiter started before window.open outlives a refusal.
+    const opened = await openConsoleTab(world.asContext(), clientUrl, { popupTimeoutMs: 50 });
 
     assert.equal(opened.via, 'new-tab');
     assert.match(opened.fallbackReason ?? '', /refused/);

@@ -54,6 +54,7 @@ import {
   type LoginButtonState,
 } from '../utils/loginButtonReady.js';
 import { consoleFocusPageScript } from '../utils/consoleFocus.js';
+import { openConsoleTab, tunneledClientUrl } from './consoleTab.js';
 import { normalizeKeyCombo, pressSpecsForText } from '../utils/keyboardText.js';
 import {
   delayForAttempt,
@@ -1753,20 +1754,18 @@ export class BrowserService {
       // profile is optional
     }
 
-    const params = new URLSearchParams({ selectedServerMoid: server.moid });
-    if (server.name) {
-      params.set('selectedServerName', server.name);
-    }
-    if (profileName) {
-      params.set('serverProfileName', profileName);
-    }
-    const clientUrl = `${origin}/cisco-vkvm/tunneled?${params.toString()}`;
+    const clientUrl = tunneledClientUrl(origin, server, profileName);
     result.clientUrl = clientUrl;
 
-    // Open the vKVM app. Poll for either the console mounting (<kvm-ui>) or the
-    // born-dead banner, so we bail fast instead of waiting the full timeout.
-    const page = await this.context.newPage();
-    await page.goto(clientUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Open the vKVM app the way the UI's own action does (window.open from the
+    // Intersight page), then poll for either the console mounting (<kvm-ui>) or
+    // the born-dead banner, so we bail fast instead of waiting the full timeout.
+    const opened = await openConsoleTab(this.context, clientUrl);
+    const page = opened.page;
+    result.openedVia = opened.via;
+    if (opened.fallbackReason) {
+      result.openedViaNote = `Opened as a bare tab, not like the UI: ${opened.fallbackReason}.`;
+    }
     const deadline = Date.now() + 45000;
     let mounted = false;
     let ended = false;

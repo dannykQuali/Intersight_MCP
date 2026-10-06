@@ -1,91 +1,58 @@
 /**
- * How to get hold of the shared browser — the decision that went wrong in
- * production and cost an agent its console.
+ * The browser belongs to the account daemon alone.
  *
- * Observed chain, all of it evidenced:
+ * It used to be a detached browser on a shared profile that ANY process could
+ * attach to over its published DevTools port. So an MCP server still running an
+ * old build — with its own login and keepalive — stayed attached after the
+ * account daemon took over, and drove a Cisco ID login in the same cookie jar:
+ * "OIDC state parameter is invalid", again, with only one daemon running.
  *
- *  1. Two vKVM renderers were wedged by a `beforeunload` dialog, so Playwright's
- *     connectOverCDP (which attaches to EVERY page) hung and hit its 5s timeout.
- *  2. A failed attach fell through to "spawn a browser", which began by DELETING
- *     the profile's DevToolsActivePort — the live browser's own port file, the
- *     only way anyone discovers it.
- *  3. Edge, launched onto a profile already in use, handed its `about:blank` to
- *     the running browser and exited without writing a new port file.
- *  4. So the spawn threw `Browser started but never published DevToolsActivePort`,
- *     and every retry repeated steps 2-4: discovery stayed broken, and the tab
- *     count grew by one blank tab per attempt (five of them by the time it was
- *     noticed).
- *
- * The rule that was missing: a browser that ANSWERS must never be treated as
- * absent, and a port file must never be deleted while something is listening on
- * it. A hung attach is evidence of a browser, not of its absence.
+ * Now the daemon launches the browser itself, on a profile of its own, and
+ * controls it over a pipe. There is no port, so there is nothing to attach to.
  */
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from '../src/services/browserAcquisition.js';
+import {
+  DAEMON_PROFILE_DIR,
+  LEGACY_SHARED_PROFILE_DIR,
+  isConsoleUrl,
+  ownedBrowserLaunchOptions,
+  pickNavigablePage,
+} from '../src/services/browserAcquisition.js';
 
-describe('deciding how to acquire the shared browser', () => {
-  it('attaches when the endpoint answers', () => {
-    const d = decideBrowserAcquisition({ endpointFromFile: 'http://127.0.0.1:40110', endpointAnswers: true });
-    assert.equal(d.action, 'attach');
+describe('the daemon\'s own browser', () => {
+  const opts = ownedBrowserLaunchOptions('C:/Edge/msedge.exe', { width: 1600, height: 900 });
+
+  it('publishes no DevTools port, so no other process can attach to it', () => {
+    const args = opts.args ?? [];
+    assert.equal(
+      args.some((a) => /^--remote-debugging-(port|address)/.test(a)),
+      false,
+      `a debugging port is an open door to the daemon's session: ${args.join(' ')}`
+    );
   });
 
-  it('retries the attach instead of spawning when the endpoint answers but attaching failed', () => {
-    // This is the exact production case: CDP is up, but one wedged page makes
-    // Playwright's attach time out. Spawning here is what caused the damage.
-    const d = decideBrowserAcquisition({
-      endpointFromFile: 'http://127.0.0.1:40110',
-      endpointAnswers: true,
-      attachFailed: true,
-    });
-    assert.equal(d.action, 'retry-attach');
-    assert.match(d.reason, /answer|running|listening/i);
+  it('uses a profile no older build knows about', () => {
+    // Older builds attach to whatever the shared profile's port file names; a
+    // different directory means they can never find this browser.
+    assert.notEqual(DAEMON_PROFILE_DIR, LEGACY_SHARED_PROFILE_DIR);
   });
 
-  it('never deletes a port file while something is listening on it', () => {
-    const d = decideBrowserAcquisition({
-      endpointFromFile: 'http://127.0.0.1:40110',
-      endpointAnswers: true,
-      attachFailed: true,
-    });
-    assert.equal(d.removeStalePortFile, false, 'deleting this file orphans a healthy browser');
+  it('is a visible browser, as the vKVM client and a human-assisted login need', () => {
+    assert.equal(opts.headless, false);
+    assert.equal(opts.executablePath, 'C:/Edge/msedge.exe');
   });
 
-  it('spawns when there is no port file at all', () => {
-    const d = decideBrowserAcquisition({ endpointFromFile: null, endpointAnswers: false });
-    assert.equal(d.action, 'spawn');
+  it('does not announce itself as automation, like the browser it replaces', () => {
+    // The detached browser was never launched by Playwright, so the SSO pages
+    // saw an ordinary browser; keep it that way.
+    assert.ok((opts.ignoreDefaultArgs as string[]).includes('--enable-automation'));
+    assert.ok((opts.args ?? []).includes('--disable-blink-features=AutomationControlled'));
   });
 
-  it('treats a port file nobody answers on as stale, and clears it', () => {
-    const d = decideBrowserAcquisition({ endpointFromFile: 'http://127.0.0.1:40110', endpointAnswers: false });
-    assert.equal(d.action, 'spawn');
-    assert.equal(d.removeStalePortFile, true, 'a dead port file must not make the next attach race');
-  });
-
-  it('attaches rather than spawning when the profile is already in use', () => {
-    // Launching onto a locked profile is what silently added a blank tab per
-    // attempt: Edge hands the URL to the running browser and exits.
-    const d = decideBrowserAcquisition({
-      endpointFromFile: null,
-      endpointAnswers: false,
-      profileInUse: true,
-    });
-    assert.equal(d.action, 'retry-attach');
-    assert.equal(d.removeStalePortFile, false);
-    assert.match(d.reason, /in use|already/i);
-  });
-
-  it('explains itself in every branch, because this failed silently for hours', () => {
-    const cases = [
-      { endpointFromFile: null, endpointAnswers: false },
-      { endpointFromFile: 'http://127.0.0.1:1', endpointAnswers: false },
-      { endpointFromFile: 'http://127.0.0.1:1', endpointAnswers: true },
-      { endpointFromFile: null, endpointAnswers: false, profileInUse: true },
-    ];
-    for (const c of cases) {
-      const d = decideBrowserAcquisition(c);
-      assert.ok(d.reason.length > 15, `every verdict needs a usable reason, got "${d.reason}"`);
-    }
+  it('sizes the window instead of emulating a viewport, so screenshots match the real console', () => {
+    assert.equal(opts.viewport, null);
+    assert.ok((opts.args ?? []).includes('--window-size=1600,900'));
   });
 });
 
@@ -101,8 +68,8 @@ describe('choosing a page to navigate', () => {
   });
 
   it('never picks a live console tab to navigate', () => {
-    // Navigating a console away is what raised "Leave site?" on someone else's
-    // session and wedged the renderer. It also destroys their console outright.
+    // Navigating a console away is what raised "Leave site?" and wedged the
+    // renderer. It also destroys that console outright, mid-installation.
     const urls = [
       'https://us-east-1.intersight.com/cisco-vkvm/tunneled?selectedServerMoid=abc',
       'https://intersight.com/',

@@ -114,8 +114,16 @@ Diagnostics: every login records a URL trail in `stepsCompleted`, and a failure 
 - The flow matches form fields from **candidate selector lists** (Okta variants: `input[name="identifier"]`, `#okta-signin-username`, `input[type="email"]`, …) rather than one hardcoded selector, and falls back to pressing Enter when no submit button matches. Cisco's login UI still changes; if a step stops matching, the debug screenshot shows where, and the fix is to add a selector to the relevant list in `performCiscoIdLogin()`.
 - If a TOTP code is rejected as already-used, it waits for the next 30s window and retries once.
 - After a re-login, vKVM tabs from the dead session are closed automatically (their consoles are useless), so the agent relaunches instead of screenshotting a dead console.
-- Concurrent callers share a single in-flight login attempt (no double submission).
+- Concurrent callers share a single in-flight login attempt (no double submission). That guard only works **within one process**, which is why exactly one process ever logs in — see below.
 - The keepalive timer is `unref`'d, so it never keeps the process alive on its own.
+
+## Exactly one process logs in: the account daemon
+
+Two logins interleaving in one browser break each other, whatever each does right on its own. The browser is shared, so its cookie jar is too: login B's OIDC state cookie replaces login A's, and A's callback is rejected with **"Invalid Request — OIDC state parameter is invalid."** The flows also navigate each other's tabs away mid-step, which shows up as *"Could not find the password field on the Cisco ID login page"*, `net::ERR_ABORTED`, or *"navigation interrupted by another navigation"*. And two logins in one 30s window generate the same TOTP code, which Okta accepts only once.
+
+That is what happened on 2026-09-26, when every server had its own recorder daemon, each with its own login and keepalive: ~950 failed logins in a morning, never counted by the lockout guard (no credential had been sent), until Intersight stopped minting sessions (`error=tokenlimit_reached`). So login, keepalive and the browser now live in the single account daemon ([VKVM_BROWSER.md](VKVM_BROWSER.md#why-one-daemon-not-one-per-server)); `browser_open`, `browser_login` and `browser_status` in any MCP server are served by it. The login also picks its tab by URL, so it never navigates any console tab away.
+
+If you see the OIDC error again, look for a second process driving the same browser profile: an MCP server still running an old build, a legacy per-server daemon (`recorder.lock` files under `~/.intersight-mcp/recordings/`), or a script of your own.
 
 **Status:** validated live 2026-07-28 — a cold automated login from a fresh browser profile completed the whole Cisco ID chain (including TOTP and the 3-account chooser) and ended authenticated on the regional host. TOTP generation is verified against the RFC 6238 test vectors; credential loading, masking, the no-credentials path, and the lockout guard are verified too.
 

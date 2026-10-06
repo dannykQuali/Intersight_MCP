@@ -31,9 +31,12 @@ import { InputArbiter } from './inputLease.js';
  * all. Only ACTIONS come through here, because they need request/response
  * semantics that files do badly (write a command file, then poll for a result?).
  *
- * Bound to 127.0.0.1 on port 0 — the OS picks a free port, which is then
- * published in the lock file for clients to discover, the same pattern
- * Chromium's DevToolsActivePort uses.
+ * Bound to 127.0.0.1 on the account daemon's fixed port, which doubles as the
+ * one-daemon-per-account lock (see daemonProtocol.ts); tests bind port 0.
+ *
+ * Routes:
+ *   /<action>                       account-level actions (hello, status, login...)
+ *   /server/<serverMoid>/<action>   one server's recorder, with its own input lease
  */
 
 /**
@@ -48,14 +51,27 @@ const CLOSE_HARD_MS = 2000;
 /** One action the daemon knows how to perform. */
 export type ControlHandler = (payload: any) => Promise<unknown>;
 
-export interface ControlServerOptions {
+/** A set of actions sharing one input lease: the account itself, or one server's console. */
+export interface ControlScope {
   /** Actions that MUTATE the console and therefore need the input lease. */
   inputActions: Record<string, ControlHandler>;
   /** Actions that only read, and are always allowed. */
   readActions: Record<string, ControlHandler>;
   arbiter: InputArbiter;
-  /** Called on every request so the daemon can track client interest. */
-  onClientContact?: (clientId: string) => void;
+}
+
+export interface ControlServerOptions extends ControlScope {
+  /**
+   * The recorder for one server, addressed as /server/<serverMoid>/<action>, or
+   * null when there is none. Each server gets its own arbiter, so one console
+   * being busy never blocks input to another.
+   */
+  serverScope?: (serverMoid: string) => ControlScope | null;
+  /**
+   * Called on every request so the daemon can track client interest — with the
+   * server it concerns, since each recorder's dormancy is its own.
+   */
+  onClientContact?: (clientId: string, serverMoid: string | null) => void;
 }
 
 export class ControlServer {
@@ -68,14 +84,18 @@ export class ControlServer {
     return this.boundPort;
   }
 
-  async listen(): Promise<number> {
+  /**
+   * Bind the port. Rejects with the socket error (EADDRINUSE when another
+   * process holds it), which is how a second daemon learns it is not needed.
+   */
+  async listen(port = 0): Promise<number> {
     const server = http.createServer((req, res) => {
       void this.handle(req, res);
     });
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       // Loopback only: this is an IPC channel, not a network service.
-      server.listen(0, '127.0.0.1', () => resolve());
+      server.listen(port, '127.0.0.1', () => resolve());
     });
     this.server = server;
     this.boundPort = (server.address() as AddressInfo).port;
@@ -126,30 +146,50 @@ export class ControlServer {
       res.end(payload);
     };
     try {
-      const action = (req.url ?? '/').replace(/^\/+/, '').split('?')[0];
+      const route = (req.url ?? '/').replace(/^\/+/, '').split('?')[0];
       const payload = await readJsonBody(req);
       const clientId = String(payload?.clientId ?? 'unknown-client');
-      this.opts.onClientContact?.(clientId);
 
-      const readHandler = this.opts.readActions[action];
+      let scope: ControlScope = this.opts;
+      let action = route;
+      let serverMoid: string | null = null;
+      const scoped = /^server\/([^/]+)\/([^/]+)$/.exec(route);
+      if (scoped) {
+        serverMoid = decodeURIComponent(scoped[1]);
+        action = scoped[2];
+        const found = this.opts.serverScope?.(serverMoid) ?? null;
+        if (!found) {
+          // Distinguishable from an unknown action: a client reading history
+          // turns this into "no recorder, here are the frames on disk".
+          return send(404, {
+            ok: false,
+            code: 'no-recorder',
+            error: `no recorder for server ${serverMoid} in this daemon`,
+          });
+        }
+        scope = found;
+      }
+      this.opts.onClientContact?.(clientId, serverMoid);
+
+      const readHandler = scope.readActions[action];
       if (readHandler) {
         return send(200, { ok: true, result: await readHandler(payload) });
       }
 
-      const inputHandler = this.opts.inputActions[action];
+      const inputHandler = scope.inputActions[action];
       if (!inputHandler) {
         return send(404, { ok: false, error: `unknown action "${action}"` });
       }
 
       // Every console-mutating action must hold the lease. Refusals carry a
       // reason and a retry hint rather than looking like silence.
-      const lease = this.opts.arbiter.acquire(clientId);
+      const lease = scope.arbiter.acquire(clientId);
       if (!lease.granted) {
         return send(409, {
           ok: false,
           error: lease.reason,
           retryAfterMs: lease.retryAfterMs,
-          busy: this.opts.arbiter.busy(),
+          busy: scope.arbiter.busy(),
         });
       }
       return send(200, { ok: true, result: await inputHandler(payload) });

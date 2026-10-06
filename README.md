@@ -23,6 +23,8 @@ The server includes browser-based vKVM tools that let an AI agent **see a server
 
 See [docs/VKVM_BROWSER.md](docs/VKVM_BROWSER.md) for details, requirements, and limitations.
 
+The browser, the login and every console recorder live in one background **account daemon** that outlives the MCP server, so a chat ending or a code reload never drops a console, and several agents can share one. It listens on `127.0.0.1:29417`; if that port is taken on your machine, set `INTERSIGHT_DAEMON_PORT` to the same free port in every MCP server's environment. After rebuilding, restart every MCP server. Its log is `~/.intersight-mcp/daemon.log`.
+
 For **unattended/overnight runs**, the server can log itself in via Cisco ID (username + password + TOTP) and keep the session alive, so a session timeout doesn't blind the agent mid-run — see [docs/UNATTENDED_LOGIN.md](docs/UNATTENDED_LOGIN.md).
 
 ### Prerequisites

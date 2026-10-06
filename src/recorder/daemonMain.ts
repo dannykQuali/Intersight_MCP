@@ -21,44 +21,44 @@
  */
 
 /**
- * Entry point for a recorder daemon: one process, one server's console.
+ * Entry point for the account daemon: one process for the browser, the login
+ * and every console recorder.
  *
  * Spawned detached by an MCP server (or by hand for debugging). It outlives
  * every MCP server, which is the point — MCP servers come and go with each chat
  * and fork, and console recordings must not.
  *
- *   node build/recorder/daemonMain.js --server <moid> [--name <n>] [--type <t>]
- *                                     [--retention-minutes N] [--interval-ms N]
- *                                     [--no-ocr] [--disk-budget-mb N]
+ *   node build/recorder/daemonMain.js [--port N] [--base-url URL]
+ *
+ * The port defaults to INTERSIGHT_DAEMON_PORT, else the built-in default. A
+ * daemon that finds the port taken exits with status 3: if the holder is our
+ * daemon, it is already doing the job.
  */
 import os from 'os';
 import path from 'path';
-import { RecorderDaemon } from './recorderDaemon.js';
+import { AccountDaemon } from './accountDaemon.js';
+import { daemonPort } from './daemonProtocol.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
-function flag(name: string): boolean {
-  return process.argv.includes(`--${name}`);
-}
-function num(name: string): number | undefined {
-  const raw = arg(name);
-  if (raw === undefined) {
-    return undefined;
-  }
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : undefined;
-}
 
-const serverMoid = arg('server');
-if (!serverMoid) {
-  console.error('usage: daemonMain --server <serverMoid> [--name <serverName>] [--type <objectType>]');
-  process.exit(2);
+const stamp = () => new Date().toISOString();
+
+// Builds before the account daemon spawned one daemon PER SERVER with
+// `--server <moid>`. An MCP server still running that code in memory can spawn
+// this file; it would then wait for a per-server lock file that never appears.
+// Saying why here puts the answer in the log that MCP server shows its caller.
+if (process.argv.includes('--server')) {
+  console.error(
+    `${stamp()} This MCP server is running an outdated build that starts one recorder daemon per server. ` +
+      'Recorders now live in a single account daemon. Restart this MCP server (reload its window or reconnect it) to pick up the new code.'
+  );
+  process.exit(3);
 }
 
-const recordingRoot = path.join(os.homedir(), '.intersight-mcp', 'recordings');
-
+const port = Number(arg('port') ?? daemonPort());
 /**
  * The daemon authenticates with the BROWSER's cookies, never an API key, so it
  * must not depend on API-key configuration. Requiring the full MCP config made
@@ -66,37 +66,22 @@ const recordingRoot = path.join(os.homedir(), '.intersight-mcp', 'recordings');
  * whenever it was spawned without those variables in its environment.
  */
 const baseUrl = arg('base-url') ?? process.env.INTERSIGHT_BASE_URL ?? 'https://intersight.com/api/v1';
-const daemon = new RecorderDaemon(
-  {
-    serverMoid,
-    serverName: arg('name'),
-    objectType: arg('type'),
-    recording: {
-      retentionMinutes: num('retention-minutes'),
-      intervalMs: num('interval-ms'),
-      heartbeatSeconds: num('heartbeat-seconds'),
-      maxFrames: num('max-frames'),
-      antiBlankSeconds: num('anti-blank-seconds'),
-      antiBlankMode: arg('anti-blank-mode') as 'mouse' | 'key' | 'none' | undefined,
-      ocrText: flag('no-ocr') ? false : undefined,
-    },
-    diskBudgetBytes: num('disk-budget-mb') ? num('disk-budget-mb')! * 1024 * 1024 : undefined,
-    onStopped: () => process.exit(0),
-  },
-  baseUrl,
-  recordingRoot
-);
+const recordingRoot = path.join(os.homedir(), '.intersight-mcp', 'recordings');
+
+// One process now holds every console, so one server's bug must not end them
+// all. A stray rejection is logged, not fatal.
+process.on('unhandledRejection', (reason) => {
+  console.error(`${stamp()} [daemon pid ${process.pid}] unhandled rejection (kept running): ${String((reason as Error)?.stack ?? reason).slice(0, 1000)}`);
+});
 
 // The log file is appended to across runs, so mark where each one begins.
-console.error(
-  `${new Date().toISOString()} === recorder daemon starting for ${serverMoid} (pid ${process.pid}, node ${
-    process.version
-  }) ===`
-);
+console.error(`${stamp()} === account daemon starting (pid ${process.pid}, node ${process.version}, port ${port}) ===`);
 
+const daemon = new AccountDaemon({ port, baseUrl, recordingRoot, onExit: () => process.exit(0) });
 const started = await daemon.start();
-// The spawner reads this line to learn the control port, then stops caring.
-console.log(JSON.stringify(started));
+console.error(`${stamp()} [daemon pid ${process.pid}] ${JSON.stringify(started)}`);
 if (!started.started) {
   process.exit(3);
 }
+process.on('SIGTERM', () => void daemon.shutdown('SIGTERM'));
+process.on('SIGINT', () => void daemon.shutdown('SIGINT'));

@@ -29,7 +29,6 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { IntersightApiService } from './services/intersightApi.js';
-import { BrowserService } from './services/browserService.js';
 import { RecorderClient } from './services/recorderClient.js';
 
 /**
@@ -46,7 +45,7 @@ const RECORDER_MONITORING_HINTS = {
     + 'KEYS: browser_send_keys for Enter/F2/Control+Alt+Delete; vkvm_press_until to repeat a key until the screen reacts (e.g. F2 during POST); browser_mouse for clicks.',
   waiting: 'vkvm_wait {mode:"stable", untilText:"login:"} to sleep through healthy phases; vkvm_watch for a bounded window',
   sharing:
-    'This console is held by a recorder daemon that outlives every MCP server. Other agents may attach to the same one; input is serialised by a short lease, and a refusal says who holds it.',
+    'This console is held by a recorder in the account daemon, which outlives every MCP server. Other agents may attach to the same one; input is serialised by a short lease, and a refusal says who holds it.',
   lifetime:
     'An idle recorder goes dormant after 6h and releases the console (frames are kept and it resumes on demand). Call vkvm_keep_alive for a known-long campaign.',
   rediscover: 'vkvm_record_status with NO serverMoid lists every recorder, live or dormant, across all MCP servers',
@@ -58,7 +57,6 @@ import { createSecurityHealthCheckReport } from './services/securityHealthCheckA
 export class IntersightMCPServer {
   private server: Server;
   private apiService: IntersightApiService;
-  private browserService: BrowserService | null = null;
   private recorderClient: RecorderClient | null = null;
   private mcpConfig: MCPServerConfig;
 
@@ -4082,7 +4080,7 @@ export class IntersightMCPServer {
       },
       {
         name: 'browser_close',
-        description: 'Close the browser window. The Intersight login cookies persist in the profile directory, so a later browser_open may not require logging in again.',
+        description: 'Does not close anything: the browser belongs to the account daemon, which shares it with every console recorder. Returns how to stop recorders instead (vkvm_record_stop); the daemon exits on its own once no recorders remain and it has been idle for an hour. Login cookies persist in the browser profile.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -5337,38 +5335,65 @@ export class IntersightMCPServer {
         console.error(`   - All affected devices tracked and resolved by name`);
         return report;
 
-      // Browser & vKVM (interactive user session)
+      // Browser & vKVM (interactive user session).
+      //
+      // All of it runs in the account daemon, which owns the one browser and the
+      // one login. An MCP server that drove the browser itself would be a second
+      // Cisco ID login in the same cookie jar — the collision that rejected every
+      // login with "OIDC state parameter is invalid".
       case 'browser_open':
-        return this.getBrowserService().open(
-          args.url,
-          args.width && args.height ? { width: args.width, height: args.height } : undefined
+        return this.getRecorderClient().account(
+          'browserOpen',
+          { url: args.url, width: args.width, height: args.height },
+          { spawnIfAbsent: true }
         );
 
-      case 'browser_status':
-        return this.getBrowserService().status();
+      case 'browser_status': {
+        const status = await this.getRecorderClient().account('browserStatus', {}, { spawnIfAbsent: false });
+        return (
+          status ?? {
+            browserOpen: false,
+            loggedIn: false,
+            daemon: 'not running',
+            note: 'No account daemon is running, so nothing holds the browser. browser_open, browser_login or any console tool starts it.',
+          }
+        );
+      }
 
       // Diagnostics that operate on the SHARED browser directly rather than on a
-      // recorder's console. They survived the move to daemons because they answer
-      // questions no daemon can: what does this page look like, and what does the
-      // API say when asked with the browser's own cookies.
+      // recorder's console. They answer questions no recorder can: what does this
+      // page look like, and what does the API say when asked with the browser's
+      // own cookies.
       case 'browser_goto':
-        return this.getBrowserService().goto(args.url, args.newPage);
+        return this.getRecorderClient().account(
+          'browserGoto',
+          { url: args.url, newPage: args.newPage },
+          { spawnIfAbsent: true }
+        );
 
       case 'browser_evaluate':
-        return this.getBrowserService().evaluate(args.script, args.serverMoid);
+        return this.getRecorderClient().account(
+          'browserEvaluate',
+          { script: args.script, serverMoid: args.serverMoid },
+          { spawnIfAbsent: true }
+        );
 
       case 'browser_intersight_api':
-        return this.getBrowserService().sessionApi(args.method, args.path, args.body);
+        return this.getRecorderClient().account(
+          'sessionApi',
+          { method: args.method, path: args.path, body: args.body },
+          { spawnIfAbsent: true }
+        );
 
       case 'browser_login':
-        return this.getBrowserService().ensureLoggedIn({ force: args.force });
+        return this.getRecorderClient().account('login', { force: args.force }, { spawnIfAbsent: true });
 
-      // --- Console tools: all routed to the per-server recorder daemon -------
+      // --- Console tools: all routed to the account daemon's recorders -------
       //
-      // No MCP server owns a console. Each server's console is held by ONE
-      // detached daemon that outlives every MCP process, so an MCP restart (on
-      // every code reload, chat and fork) no longer drops a recording, and two
-      // agents can watch or drive the same machine.
+      // No MCP server owns a console. Every server's console is held by a
+      // recorder inside ONE detached daemon that outlives every MCP process, so
+      // an MCP restart (on every code reload, chat and fork) no longer drops a
+      // recording, and two agents can watch or drive the same machine.
       case 'launch_vkvm_session': {
         const server = await this.resolvePhysicalServer(args.serverMoid);
         const client = this.getRecorderClient();
@@ -5388,7 +5413,7 @@ export class IntersightMCPServer {
         return {
           server: { Moid: server.moid, ObjectType: server.objectType, Name: server.name },
           consoleOpen: !degraded,
-          recorder: spawned ? 'started a new recorder daemon for this server' : 'attached to the recorder daemon already running for this server',
+          recorder: spawned ? 'started a new recorder for this server' : 'attached to the recorder already running for this server',
           ...(degraded
             ? {
                 consoleProblem:
@@ -5503,7 +5528,7 @@ export class IntersightMCPServer {
         const degraded = phase === 'degraded' || status?.phase === 'degraded';
         return {
           recording: !degraded,
-          recorder: spawned ? 'started a new recorder daemon' : 'a recorder daemon was already running; attached to it (options apply only to a NEW daemon)',
+          recorder: spawned ? 'started a new recorder' : 'a recorder was already running for this server; attached to it (options apply only to a NEW recorder)',
           ...(degraded
             ? {
                 consoleProblem:
@@ -5532,11 +5557,11 @@ export class IntersightMCPServer {
       case 'vkvm_record_status': {
         const client = this.getRecorderClient();
         if (!args.serverMoid) {
-          return { recorders: client.list() };
+          return { recorders: await client.list() };
         }
-        if (!client.isLive(args.serverMoid)) {
-          const known = client.list().find((r) => r.serverMoid === args.serverMoid);
-          return known ?? { serverMoid: args.serverMoid, live: false, note: 'No recorder daemon and no recorded frames for this server.' };
+        if (!(await client.isLive(args.serverMoid))) {
+          const known = (await client.list()).find((r) => r.serverMoid === args.serverMoid);
+          return known ?? { serverMoid: args.serverMoid, live: false, note: 'No recorder and no recorded frames for this server.' };
         }
         return client.call(args.serverMoid, 'status', {});
       }
@@ -5614,7 +5639,15 @@ export class IntersightMCPServer {
         return this.resetTunneledVkvm(args.serverMoid);
 
       case 'browser_close':
-        return this.getBrowserService().close();
+        // Nothing to detach: this process never holds the browser. Closing the
+        // daemon's hold on it would end every console it is recording.
+        return {
+          closed: false,
+          note:
+            'The browser belongs to the account daemon, which shares it with every recorder, so it is not closed from here. ' +
+            'Stop recorders with vkvm_record_stop; the daemon exits by itself once none remain and it has been idle for an hour. ' +
+            'Login cookies persist in the browser profile either way.',
+        };
 
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -5622,31 +5655,15 @@ export class IntersightMCPServer {
   }
 
   /**
-   * Talks to the per-server recorder daemons. Console work goes through these:
-   * this process owns no console, so nothing it does — including exiting — can
-   * interrupt a recording or another agent's session.
+   * Talks to the account daemon. Browser, login and console work all go through
+   * it: this process owns none of them, so nothing it does — including exiting —
+   * can interrupt a recording or another agent's session.
    */
   private getRecorderClient(): RecorderClient {
     if (!this.recorderClient) {
       this.recorderClient = new RecorderClient(loadConfig().baseUrl);
     }
     return this.recorderClient;
-  }
-
-  /**
-   * A BrowserService for GENERAL browser work only (login checks, session-authed
-   * API calls, goto/evaluate). It deliberately never launches or records a
-   * console: that authority belongs to the daemons.
-   */
-  private getBrowserService(): BrowserService {
-    if (!this.browserService) {
-      this.browserService = new BrowserService(loadConfig().baseUrl);
-      // Lets a recorder escalate to the Tunneled vKVM disable/re-enable when a
-      // relaunched console keeps coming back dead (an Intersight bug that no
-      // amount of relaunching fixes).
-      this.browserService.setTunneledVkvmResetter((moid) => this.resetTunneledVkvm(moid));
-    }
-    return this.browserService;
   }
 
   /**

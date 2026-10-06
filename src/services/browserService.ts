@@ -24,8 +24,7 @@ import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
-import { chromium, Browser, BrowserContext, Page } from 'playwright-core';
+import { chromium, BrowserContext, Page } from 'playwright-core';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import { loadSsoConfig, SsoConfig } from '../utils/config.js';
@@ -42,7 +41,7 @@ import {
 import { canvasPointToViewport, fromScaledFrame, type CanvasGeometry } from '../utils/frameCoords.js';
 import type { NoSignalReading } from './vkvmRecorder.js';
 import { consoleCanvasGeometryPageScript } from '../utils/consoleCanvasCapture.js';
-import { decideBrowserAcquisition, isConsoleUrl, pickNavigablePage } from './browserAcquisition.js';
+import { DAEMON_PROFILE_DIR, ownedBrowserLaunchOptions, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
 import { lockoutExemptionReason } from '../utils/loginFailureClassification.js';
 import { CISCO_ID_EMAIL_SELECTORS } from '../utils/intersightLoginForm.js';
@@ -68,13 +67,6 @@ import {
 import { verifyTypedText } from '../utils/typedTextVerdict.js';
 
 /**
- * How long to wait for an attach. Generous: Playwright attaches to every page,
- * and a busy shared browser with a dozen tabs is slow rather than absent — a 5s
- * timeout here was read as "no browser" and triggered a destructive spawn.
- */
-const ATTACH_TIMEOUT_MS = 20000;
-
-/**
  * How long to wait for the Cisco ID login button to become clickable.
  *
  * Generous: the page was still booting after 30s in the field, and waiting costs
@@ -84,12 +76,6 @@ const LOGIN_BUTTON_READY_MS = 45000;
 
 /** Bounded click, because the wait above is what gives the page its time. */
 const LOGIN_CLICK_TIMEOUT_MS = 10000;
-
-/** Liveness probe for a published CDP endpoint. Cheap HTTP, no page attach. */
-const ENDPOINT_PROBE_MS = 3000;
-
-/** Attach retries while a browser is known to be running but not yet reachable. */
-const ATTACH_RETRIES = 3;
 
 /** Time for the console to finish drawing before its text is read back. */
 const SETTLE_BEFORE_READ_MS = 600;
@@ -130,6 +116,8 @@ export interface MouseInput {
  */
 export class BrowserService {
   private context: BrowserContext | null = null;
+  /** The browser launch in progress, shared by everyone who needs it meanwhile. */
+  private contextLaunch: Promise<BrowserContext> | null = null;
   private kvmPages = new Map<string, Page>(); // serverMoid -> KVM client page
   private readonly origin: string;
   private readonly profileDir: string;
@@ -153,12 +141,6 @@ export class BrowserService {
    */
   private mechanicalLoginFailures = 0;
   private loginDisabledReason: string | null = null;
-  // The shared browser is a DETACHED OS process owned by no MCP instance: every
-  // instance attaches to it over CDP (a profile can only be owned by one
-  // Chromium process), and none of them can take it down by exiting. This
-  // handle is our CDP connection to it.
-  private attachedBrowser: Browser | null = null;
-  private adoptedKvmTabs: string[] = [];
   // Continuous console recorders, one per server MOID.
   private recorders = new Map<string, VkvmRecorder>();
   private readonly recordingDir: string;
@@ -172,9 +154,9 @@ export class BrowserService {
   // agent is actually using, which is why this is tracked per server.
   private agentInput = new AgentInputTracker();
   /**
-   * Disable/re-enable Tunneled vKVM on a server. Injected by the MCP server,
-   * which owns the API client; the recorder escalates to it when a relaunched
-   * console keeps coming back dead.
+   * Disable/re-enable Tunneled vKVM on a server. Injected by the account daemon,
+   * which marks that server busy for the duration; the recorder escalates to it
+   * when a relaunched console keeps coming back dead.
    */
   private tunneledVkvmResetter: ((serverMoid: string) => Promise<unknown>) | null = null;
 
@@ -182,7 +164,7 @@ export class BrowserService {
     // baseUrl is e.g. https://intersight.com/api/v1 -> keep the origin only
     this.origin = new URL(intersightBaseUrl).origin;
     const home = path.join(os.homedir(), '.intersight-mcp');
-    this.profileDir = path.join(home, 'browser-profile');
+    this.profileDir = path.join(home, DAEMON_PROFILE_DIR);
     this.screenshotDir = path.join(home, 'screenshots');
     this.recordingDir = path.join(home, 'recordings');
     this.sso = loadSsoConfig();
@@ -190,68 +172,6 @@ export class BrowserService {
 
   isOpen(): boolean {
     return this.context !== null;
-  }
-
-  /**
-   * The CDP endpoint of a browser already running on our profile, if any.
-   * Chromium writes DevToolsActivePort into the user-data-dir when launched
-   * with --remote-debugging-port=0 (line 1 = OS-assigned port).
-   */
-  private devtoolsEndpoint(): string | null {
-    try {
-      const raw = fs.readFileSync(path.join(this.profileDir, 'DevToolsActivePort'), 'utf8').trim().split('\n');
-      const port = Number(raw[0]);
-      return Number.isFinite(port) && port > 0 ? `http://127.0.0.1:${port}` : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Attach to a browser already running on this profile instead of launching a
-   * competing one. A profile can only be owned by one Chromium process, so
-   * without this a second MCP server instance would fail with "Opening in
-   * existing browser session" (and must NEVER kill the running browser — it may
-   * be driving someone's live console). The file can also be stale, so a failed
-   * connect simply falls through to launching.
-   */
-  private async tryAttach(timeoutMs = ATTACH_TIMEOUT_MS): Promise<BrowserContext | null> {
-    const endpoint = this.devtoolsEndpoint();
-    if (!endpoint) {
-      return null;
-    }
-    try {
-      const browser = await chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
-      const ctx = browser.contexts()[0];
-      if (!ctx) {
-        // NEVER browser.close() here: on a CDP connection that quits the shared
-        // browser, killing every console on it — the one thing this design
-        // promises not to do. Dropping the reference is enough.
-        return null;
-      }
-      this.attachedBrowser = browser;
-      this.watchForDialogs(ctx);
-      return ctx;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Keep trying to attach to a browser we KNOW is there.
-   *
-   * A wedged page can stall Playwright's attach for a while and then let go, so
-   * a few patient attempts recover without touching the running browser.
-   */
-  private async retryAttach(): Promise<BrowserContext | null> {
-    for (let i = 0; i < ATTACH_RETRIES; i++) {
-      const ctx = await this.tryAttach(ATTACH_TIMEOUT_MS);
-      if (ctx) {
-        return ctx;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    return null;
   }
 
   /** Read the console back and judge whether the text landed. */
@@ -293,42 +213,13 @@ export class BrowserService {
     return context.newPage();
   }
 
-  /** Does a browser answer on the endpoint the profile published? */
-  private async endpointAnswers(endpoint: string): Promise<boolean> {
-    try {
-      const res = await fetch(`${endpoint}/json/version`, {
-        signal: AbortSignal.timeout(ENDPOINT_PROBE_MS),
-      });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Is a browser already holding this profile?
-   *
-   * Chromium keeps a lock file while it owns a user-data-dir. Launching onto a
-   * held profile does not start a browser: the new process hands its URL to the
-   * running one and exits, which is how five stray about:blank tabs accumulated
-   * while every attach failed.
-   */
-  private profileInUse(): boolean {
-    for (const name of ['SingletonLock', 'lockfile', 'SingletonSocket']) {
-      if (fs.existsSync(path.join(this.profileDir, name))) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   /**
    * Dismiss any dialog a page raises, so one can never wedge a renderer.
    *
-   * A `beforeunload` dialog blocks its renderer until a human clicks, and because
-   * Playwright's attach touches every page, ONE such dialog made every attach in
-   * every process fail. Dismissing keeps the page (accepting would discard it),
-   * which is the safe default for a console someone may be using.
+   * A `beforeunload` dialog blocks its renderer until a human clicks — and in
+   * the shared-browser days, ONE such dialog made every attach in every process
+   * fail. Dismissing keeps the page (accepting would discard it), which is the
+   * safe default for a console someone may be using.
    */
   private watchForDialogs(context: BrowserContext): void {
     const attach = (page: Page) => {
@@ -341,169 +232,48 @@ export class BrowserService {
   }
 
   /**
-   * Re-register vKVM tabs opened by another instance, so an attached instance
-   * can address existing consoles by serverMoid instead of treating them as
-   * unknown tabs.
+   * The daemon's own browser, launched on first use.
+   *
+   * Launched, never attached to: Playwright drives it over a pipe, so it has no
+   * DevTools port and no other process can reach its pages or its cookies. That
+   * matters because a second process in this browser means a second Cisco ID
+   * login in the same cookie jar, and two interleaved logins reject each other
+   * ("OIDC state parameter is invalid"). The account daemon is the one process
+   * per account, so it is also the only one that ever holds this profile.
+   *
+   * The browser lives exactly as long as the daemon, which is the durable
+   * process now; an MCP server restarting touches neither. Concurrent callers
+   * share one launch — a second launch onto the same profile would fail.
    */
-  private adoptExistingKvmTabs(context: BrowserContext): string[] {
-    const adopted: string[] = [];
-    for (const page of context.pages()) {
-      try {
-        const url = new URL(page.url());
-        if (!isConsoleUrl(url.pathname)) {
-          continue;
-        }
-        const moid = url.searchParams.get('selectedServerMoid');
-        if (!moid || this.kvmPages.has(moid)) {
-          continue;
-        }
-        this.kvmPages.set(moid, page);
-        // Remember enough to relaunch this console if its session later dies.
-        if (!this.kvmServers.has(moid)) {
-          this.kvmServers.set(moid, {
-            moid,
-            objectType: 'compute.RackUnit',
-            name: url.searchParams.get('selectedServerName') ?? undefined,
-          });
-        }
-        adopted.push(moid);
-        page.on('close', () => {
-          if (this.kvmPages.get(moid) === page) {
-            this.kvmPages.delete(moid);
-          }
-        });
-      } catch {
-        // ignore non-URL pages
-      }
+  private ensureContext(viewport?: { width: number; height: number }): Promise<BrowserContext> {
+    if (this.context) {
+      return Promise.resolve(this.context);
     }
-    return adopted;
+    this.contextLaunch ??= this.launchOwnedBrowser(viewport).finally(() => {
+      this.contextLaunch = null;
+    });
+    return this.contextLaunch;
   }
 
-  private async ensureContext(viewport?: { width: number; height: number }): Promise<BrowserContext> {
-    if (this.context) {
-      return this.context;
+  private async launchOwnedBrowser(viewport?: { width: number; height: number }): Promise<BrowserContext> {
+    const exe = findBrowserExecutable();
+    if (!exe) {
+      throw new Error('No Edge or Chrome installation found to launch. Install one to use the browser and vKVM tools.');
     }
     fs.mkdirSync(this.profileDir, { recursive: true });
     fs.mkdirSync(this.screenshotDir, { recursive: true });
-
-    // 1. Reuse a browser another MCP server instance already has open on this
-    //    profile (shared login + shared consoles), rather than competing for it.
-    const attached = await this.tryAttach();
-    if (attached) {
-      this.context = attached;
-      this.adoptedKvmTabs = this.adoptExistingKvmTabs(attached);
-      this.context.on('close', () => {
+    const context = await chromium.launchPersistentContext(this.profileDir, ownedBrowserLaunchOptions(exe, viewport));
+    this.watchForDialogs(context);
+    context.on('close', () => {
+      // A human closing the window: the next use launches a fresh browser, and
+      // the profile keeps the login cookies.
+      if (this.context === context) {
         this.context = null;
         this.kvmPages.clear();
-      });
-      return this.context;
-    }
-
-    // 2. Otherwise spawn a browser DETACHED and attach to it over CDP, exactly
-    //    as if another instance had launched it.
-    //
-    //    Not launchPersistentContext: Playwright closes a browser it launched
-    //    when its Node process exits, and this MCP server restarts every time
-    //    its code is reloaded. With several MCP instances sharing one browser,
-    //    whichever instance happened to launch it became a hidden single point
-    //    of failure — verified painfully: another agent's live console sessions
-    //    died mid-use, twice, each time this server's window was restarted.
-    //    A detached OS process is owned by nobody; every instance (including
-    //    this one) is just an attacher, and restarts kill nothing.
-    // A failed attach does NOT mean there is no browser. Ask before spawning:
-    // spawning onto a live profile deleted the running browser's port file and
-    // orphaned it, breaking discovery for every process on the machine.
-    const endpoint = this.devtoolsEndpoint();
-    const decision = decideBrowserAcquisition({
-      endpointFromFile: endpoint,
-      endpointAnswers: endpoint ? await this.endpointAnswers(endpoint) : false,
-      attachFailed: true,
-      profileInUse: this.profileInUse(),
+      }
     });
-
-    if (decision.action === 'retry-attach') {
-      const reattached = await this.retryAttach();
-      if (reattached) {
-        this.context = reattached;
-        this.adoptedKvmTabs = this.adoptExistingKvmTabs(reattached);
-        reattached.on('close', () => {
-          this.context = null;
-          this.kvmPages.clear();
-        });
-        return reattached;
-      }
-      throw new Error(
-        `A browser is already running on this profile but could not be attached to: ${decision.reason}. ` +
-          'A stuck page dialog is the usual cause — dismiss it in the browser window, or close that tab. ' +
-          'Launching a second browser here would orphan the running one, so it is deliberately not attempted.'
-      );
-    }
-
-    await this.spawnDetachedBrowser(viewport, decision.removeStalePortFile);
-    const spawned = await this.tryAttach();
-    if (!spawned) {
-      throw new Error(
-        'Spawned a browser but could not attach to it (DevToolsActivePort never became connectable).'
-      );
-    }
-    this.context = spawned;
-    this.context.on('close', () => {
-      this.context = null;
-      this.kvmPages.clear();
-    });
-    return this.context;
-  }
-
-  /**
-   * Start the shared browser as a detached OS process on our profile, with a
-   * CDP port published in DevToolsActivePort, and wait until it is attachable.
-   */
-  private async spawnDetachedBrowser(
-    viewport?: { width: number; height: number },
-    removeStalePortFile = false
-  ): Promise<void> {
-    const exe = findBrowserExecutable();
-    if (!exe) {
-      throw new Error(
-        'No Edge or Chrome installation found to launch. Install one, or start a browser on the profile manually.'
-      );
-    }
-    // A stale port file would make the post-spawn attach race against the old
-    // dead port. Removed ONLY when nothing answers on it — deleting a live
-    // browser's port file orphans it, and that is how discovery stayed broken
-    // for hours while every retry added another blank tab.
-    if (removeStalePortFile) {
-      try {
-        fs.unlinkSync(path.join(this.profileDir, 'DevToolsActivePort'));
-      } catch {
-        /* none there */
-      }
-    }
-    const size = viewport ?? { width: 1600, height: 900 };
-    const child = spawn(
-      exe,
-      [
-        `--user-data-dir=${this.profileDir}`,
-        '--remote-debugging-port=0',
-        '--disable-blink-features=AutomationControlled',
-        `--window-size=${size.width},${size.height}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        'about:blank',
-      ],
-      { detached: true, stdio: 'ignore' }
-    );
-    // Fully disown it: the whole point is that it outlives this process.
-    child.unref();
-
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      if (this.devtoolsEndpoint()) {
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    throw new Error(`Browser started (${path.basename(exe)}) but never published DevToolsActivePort.`);
+    this.context = context;
+    return context;
   }
 
   /** Open the browser window and navigate to the Intersight login page. */
@@ -666,8 +436,7 @@ export class BrowserService {
       pages,
       kvmSessions: [...this.kvmPages.keys()],
       browserOwnership:
-        'detached (the browser is a shared OS process owned by no MCP instance; it survives every instance restart, and browser_close only detaches)',
-      ...(this.adoptedKvmTabs.length ? { adoptedKvmTabs: this.adoptedKvmTabs } : {}),
+        'owned by the account daemon (launched by it on a private profile, with no DevTools port, so no other process can attach); it lives as long as the daemon, and MCP server restarts do not touch it',
       autoLogin: this.autoLoginStatus(),
     };
   }
@@ -844,7 +613,6 @@ export class BrowserService {
     if (opts?.force) {
       // An explicit forced login re-arms the failure circuit breaker.
       this.loginFailures = 0;
-    this.mechanicalLoginFailures = 0;
       this.mechanicalLoginFailures = 0;
       this.loginDisabledReason = null;
     }
@@ -925,9 +693,9 @@ export class BrowserService {
     const context = await this.ensureContext();
     const steps: string[] = [];
     // Never hijack a vKVM console tab for the login flow (navigating it away
-    // would kill that console). Use a non-KVM tab, or open a fresh one.
-    const kvmSet = new Set(this.kvmPages.values());
-    const page = context.pages().find((p) => !kvmSet.has(p) && !p.isClosed()) ?? (await context.newPage());
+    // would kill that console). Judged by URL, not by which tabs this process
+    // opened: a console tab opened by a human, or adopted late, is just as live.
+    const page = await this.pageToNavigate(context);
     await page.bringToFront().catch(() => {});
 
     try {
@@ -3494,10 +3262,9 @@ export class BrowserService {
   }
 
   /**
-   * Detach from the shared browser. Never closes it: the browser runs as a
-   * detached OS process precisely so that no MCP instance's lifecycle — exit,
-   * restart, or this call — can kill a console another agent is using. Truly
-   * closing it is a deliberate human action (close the window).
+   * Close the browser. Only the account daemon calls this, as it exits: the
+   * browser is its own, so nobody else is using it. Login cookies persist in
+   * the profile for the next daemon.
    */
   async close(): Promise<any> {
     this.stopKeepalive();
@@ -3505,25 +3272,19 @@ export class BrowserService {
       recorder.stop();
     }
     this.recorders.clear();
-    if (!this.context) {
+    const context = this.context ?? (await this.contextLaunch?.catch(() => null)) ?? null;
+    this.context = null;
+    this.kvmPages.clear();
+    if (!context) {
       return { closed: false, reason: 'Browser was not open' };
     }
-    // Drop our references without touching the browser or its tabs.
-    this.context = null;
-    this.attachedBrowser = null;
-    this.kvmPages.clear();
-    this.adoptedKvmTabs = [];
-    return {
-      closed: false,
-      detached: true,
-      note: 'Detached. The browser keeps running (it is shared between MCP instances and owned by none); close its window manually to truly quit it. Login cookies persist in the profile either way.',
-    };
+    await context.close().catch(() => {});
+    return { closed: true };
   }
 }
 
 /**
- * A locally installed Edge or Chrome to spawn as the shared browser.
- * Preference order matches what launchPersistentContext used: Edge, then Chrome.
+ * A locally installed Edge or Chrome for the daemon to launch: Edge, then Chrome.
  */
 function findBrowserExecutable(): string | null {
   const programFiles = [

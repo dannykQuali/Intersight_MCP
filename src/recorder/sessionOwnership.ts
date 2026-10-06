@@ -37,9 +37,9 @@
  *  - Ending is `PATCH {"Status":"Ended"}`; DELETE returns 403 "Operation not
  *    supported".
  *
- * Only the daemon holding this server's lock is the authority, which is what
- * makes ending safe at all: with a single authority per server there is no
- * second party to fight.
+ * Only this server's recorder in the account daemon is the authority, which is
+ * what makes ending safe at all: the daemon keeps one recorder per server, so
+ * there is no second party to fight.
  */
 
 /** A session created this recently may belong to a client still mounting it. */
@@ -57,7 +57,7 @@ export interface SessionFacts {
   hasAdoptableTab: boolean;
   /** A recorder in another process is publishing fresh state for this server. */
   liveRecorderElsewhere: boolean;
-  /** We hold this server's recorder lock. */
+  /** We are this server's one recorder. */
   weAreTheAuthority: boolean;
   createdAt: number;
   now: number;

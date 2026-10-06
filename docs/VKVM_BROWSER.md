@@ -54,32 +54,51 @@ An MCP server is a short-lived thing. It restarts on every code reload, and ever
 - After an MCP restart the next launch failed with the session slot still occupied by the previous run's session, and nothing could free it — the recorder that owned it was gone.
 - Nobody could tell *whose* session an existing one was, so the safe action was always "leave it", and orphans accumulated (four dead vKVM tabs piled up on one server).
 
-So the recorder became the durable thing and the MCP server became a thin client:
+So the recorders moved into a durable process, and the MCP server became a thin client:
 
 ```
 ┌─ MCP server (transient) ─┐        ┌─ MCP server (another window) ─┐
 │      RecorderClient      │        │        RecorderClient         │
 └────────────┬─────────────┘        └───────────────┬───────────────┘
-             │  discover by lock file, act over HTTP/127.0.0.1
+             │  hello on 127.0.0.1:29417, then act over HTTP
              └──────────────┬───────────────────────┘
                             ▼
-        ┌─ recorder daemon (one per server, detached) ─┐
-        │  RecorderDaemon: login · session repair ·    │
-        │  capture · OCR · dormancy · input arbitration│
-        └───────────────────┬─────────────────────────┘
-                            ▼
+   ┌─ account daemon (ONE per account, detached) ──────────────┐
+   │  AccountDaemon: the browser · the login · the keepalive   │
+   │    ├─ ServerRecorder  server A  (own input lease)         │
+   │    ├─ ServerRecorder  server B                            │
+   │    └─ …   session repair · capture · OCR · dormancy       │
+   └───────────────────────┬───────────────────────────────────┘
+                           ▼
         detached Chromium (shared, owned by nobody)
 ```
 
-- **One daemon per server**, enforced by `recorder.lock` beside that server's frames ([src/recorder/recorderLock.ts](../src/recorder/recorderLock.ts)). It holds the pid and the control port. A lock whose pid is dead is taken over; a lock whose pid is alive turns a second daemon away. A lock is also self-correcting: if nothing answers on its port, the client clears it, because the OS reuses pids and an eternally "live" lock pointing at a dead port would make that server unrecordable forever.
-- **Discovery is by filesystem, not memory** — the same trick Chromium uses with `DevToolsActivePort`. A brand-new MCP process that shares nothing with the old one still finds the running recorder ([src/services/recorderClient.ts](../src/services/recorderClient.ts)).
+- **One daemon per account** ([src/recorder/accountDaemon.ts](../src/recorder/accountDaemon.ts)). It owns the only connection to the browser, the only Cisco ID login, the only session keepalive, and a recorder for every server being watched ([src/recorder/serverRecorder.ts](../src/recorder/serverRecorder.ts)). The MCP server's own browser tools (`browser_open`, `browser_status`, `browser_login`, `browser_goto`, `browser_evaluate`, `browser_intersight_api`) are served by it too. See *Why one daemon, not one per server* below.
+- **The listening port is the lock** ([src/recorder/daemonProtocol.ts](../src/recorder/daemonProtocol.ts)). The daemon listens on `127.0.0.1:29417` (override with `INTERSIGHT_DAEMON_PORT`; every MCP server must use the same value). Only one process can listen on an address and port, on Windows, macOS and Linux alike, and the OS takes the port back the moment that process dies — even on a crash. So there is no lock file to go stale, no pid to be reused, and nothing a client can delete. A second daemon just fails to bind, says who holds the port, and exits. The default sits below every OS's ephemeral range (Linux starts at 32768), so no outgoing connection can be squatting on it.
+- **Discovery is one hello.** A client posts `/hello`; the answer must name the service (`intersight-mcp-daemon`) and the protocol version, so an unrelated program that happens to own the port is reported, never talked to — and a daemon still running an older build's protocol is reported with its pid ([src/services/recorderClient.ts](../src/services/recorderClient.ts)). A *refused* connection is the only thing that means "no daemon"; then the client spawns one and says hello again. Two MCP servers doing that at once is safe: one daemon wins the port, the other exits, both clients end up on the winner. A port held by something that does not answer is reported, not "cleared" — nothing is ever deleted to make room.
 - **Nobody owns a recorder.** Any MCP server may attach, so two agents can watch and drive the same console.
-- **Spawning is detached** (`detached: true`, stdio to `daemon.log`), so the daemon outlives the process that started it. Verified live: the spawner exits, the daemon keeps recording.
-- **The evidence is on disk, not in a process.** Frames, `state.json` and `text.jsonl` live beside each other, so a background watcher can poll a recorder's state with no protocol and no dependency on this server. The `vkvm_*` read tools go through the daemon (it holds the frame index and the OCR transcript) and never spawn one — see below.
+- **Spawning is detached** (`detached: true`, stdio to `~/.intersight-mcp/daemon.log`, rotated at 20 MB when a new daemon is spawned), so the daemon outlives the process that started it.
+- **The evidence is on disk, not in a process.** Frames, `state.json` and `text.jsonl` live beside each other in `~/.intersight-mcp/recordings/<serverMoid>/`, so a background watcher can poll a recorder's state with no protocol and no dependency on this server. The `vkvm_*` read tools go through the daemon (it holds the frame index and the OCR transcript) and never start a recorder — see below.
+- **Its own lifetime:** the daemon exits once it has no recorders and no client has called for an hour. A dormant recorder still counts: it holds frames that resume on demand.
 
-### Each daemon is the single authority for its server
+Routes on the control port: `/<action>` for the account (`hello`, `status`, `ensureRecorder`, `login`, `browserOpen`, `browserStatus`, `browserGoto`, `browserEvaluate`, `sessionApi`, `shutdown`), and `/server/<serverMoid>/<action>` for one recorder (`status`, `sendKeys`, `pasteText`, `mouse`, `recent`, `timeline`, `stop`, …). Each server has its own input lease and busy state, so a ~90 s Tunneled vKVM reset on one server never blocks input to another.
 
-This is what finally made session repair safe. When two parties could act on one server, ending a "stale" session made someone else's recorder relaunch and escalate to a ~90-second Tunneled vKVM reset. With one authority per server there is nobody left to fight, so the daemon can clean up on startup ([src/recorder/sessionOwnership.ts](../src/recorder/sessionOwnership.ts)):
+### Why one daemon, not one per server
+
+The first version ran one daemon **per server**, and each carried its own copy of the login machinery and its own session keepalive. They all attached to the same shared browser — so they shared one cookie jar — and drove Cisco ID logins in it independently. Observed on 2026-09-26:
+
+- Two logins interleaving in one cookie jar overwrite each other's **OIDC state cookie**, so each callback was rejected: *"Invalid Request — OIDC state parameter is invalid."* The half-finished flows also navigated each other's tabs away, which surfaced as *"Could not find the password field on the Cisco ID login page"*, `net::ERR_ABORTED`, and *"navigation interrupted by another navigation"*.
+- Those failures happen before any credential is sent, so they never counted toward the three-strike lockout guard, and the keepalive's forced re-login reset the counters anyway: the thrash never stopped. **~950 failed logins in one morning**, ending with Intersight refusing to mint more sessions (`error=tokenlimit_reached … Could not create token in CTS`; the per-user limit is 32).
+- **Dormant** daemons, which had already released their consoles, kept logging in every 4 minutes: dormancy stopped the recorder, never the keepalive.
+- A client that could not reach a daemon **deleted its lock file** — without checking whether the daemon was alive. The next client then spawned a second daemon for the same server, and a third.
+
+One process per account removes every one of those by construction: one browser connection, one login in flight, one keepalive, and no lock file for anyone to delete. The login also picks its tab by URL, so it can never navigate *any* console tab away, including one it did not open.
+
+**Upgrading from the per-server design.** When the account daemon starts, it finds per-server daemons left by older builds (by the `recorder.lock` each wrote beside its frames) and asks each to stop with `force` ([src/recorder/legacyDaemons.ts](../src/recorder/legacyDaemons.ts)); their frames are kept, and the next use of that console starts a recorder in the account daemon. An MCP server still running old code in memory would spawn `daemonMain.js --server …`; the new entry point refuses that and logs *"Restart this MCP server"*. So after rebuilding, restart (reconnect) every MCP server.
+
+### Each recorder is the single authority for its server
+
+This is what finally made session repair safe. When two parties could act on one server, ending a "stale" session made someone else's recorder relaunch and escalate to a ~90-second Tunneled vKVM reset. The daemon keeps at most one recorder per server, so there is nobody left to fight, and the recorder can clean up when it opens its console ([src/recorder/sessionOwnership.ts](../src/recorder/sessionOwnership.ts)):
 
 | What it sees | Verdict |
 |---|---|
@@ -137,9 +156,10 @@ Keeping a recorder alive is not free — it holds the server's only session slot
 |---|---|---|
 | No client contact | 6 h | **dormant**: release the console and session, keep every frame; resumes on demand |
 | Powered-off server, quiet | 30 min | dormant early — there is no console to watch |
-| Newest frame older than | 3 days | data expires and the daemon exits (long enough that an overnight run is reviewable next working day) |
-| Cannot open a console | 30 min | give up and exit, unless a client is still asking |
+| Newest frame older than | 3 days | data expires and the recorder is removed (long enough that an overnight run is reviewable next working day) |
+| Cannot open a console | 30 min | the recorder gives up and is removed, unless a client is still asking |
 | Disk over budget | 2 GB | dormant data is dropped; an **active** recorder's frames never are |
+| Daemon with no recorders, no client contact | 1 h | the account daemon exits; the next MCP call starts a fresh one |
 
 Giving up on a console matters more than it sounds: every retry attempts a Cisco ID login, and that path locks the account after three failures. Retries back off (1 min doubling to 15 min), and a client asking for the console retries immediately — an agent watching `vkvm_record_status` while a human clears an MFA prompt is exactly who the daemon is for. `vkvm_keep_alive` pins a recorder awake for a known-long campaign.
 
@@ -182,7 +202,8 @@ vkvm_wait           {mode}      → block until the screen changes / stabilizes,
 vkvm_press_until    {keys}      → hammer key(s) until the screen changes/stabilizes (enter BIOS)
 vkvm_watch          {durationMs}→ record a window; report every change with timestamps
 reset_tunneled_vkvm {serverMoid}→ fix for the "KVM session has ended" Intersight bug
-close_vkvm_session / browser_close
+close_vkvm_session              → stop this server's recorder (browser_close closes nothing:
+                                  the browser belongs to the account daemon and every recorder)
 ```
 
 Support/diagnostic tools: `browser_goto` (navigate a tab), `browser_evaluate` (run JS in the page, e.g. inspect the KVM client DOM), `browser_intersight_api` (any session-authenticated Intersight REST call).

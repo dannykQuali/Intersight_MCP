@@ -92,13 +92,10 @@ describe('pasting text into a console through the daemon', () => {
     let peerError = '';
     (fake.browser as any).pasteText = async () => {
       // While this is in flight, the daemon should already be marked busy.
-      const res = await fetch(`http://127.0.0.1:${port}/sendKeys`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ clientId: 'peer-agent', text: 'x' }),
-      });
-      const body = (await res.json()) as any;
-      peerError = `${res.status} ${body.error ?? ''}`;
+      await callDaemon(port, 'sendKeys', { clientId: 'peer-agent', text: 'x' }).then(
+        () => (peerError = '200 accepted'),
+        (error: Error) => (peerError = error.message)
+      );
       return { verified: true, submitted: false, attempts: [] };
     };
 

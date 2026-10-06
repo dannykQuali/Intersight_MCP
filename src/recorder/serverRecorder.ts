@@ -22,11 +22,10 @@
 
 import fs from 'fs';
 import path from 'path';
-import { BrowserService } from '../services/browserService.js';
+import type { BrowserService } from '../services/browserService.js';
 import { RecorderOptions } from '../services/vkvmRecorder.js';
-import { ControlServer } from './controlServer.js';
+import type { ControlScope } from './controlServer.js';
 import { InputArbiter } from './inputLease.js';
-import { acquireServerLock, releaseLock } from './recorderLock.js';
 import { classifySession } from './sessionOwnership.js';
 import { estimateTypingMs, PASTE_CHAR_DELAY_MS } from '../utils/pacedTyping.js';
 import {
@@ -37,22 +36,20 @@ import {
 } from './lifetimePolicy.js';
 
 /**
- * One long-lived process that owns ONE server's console.
+ * The recorder for ONE server's console, living inside the account daemon.
  *
- * The MCP server used to own recorders, which made every code reload a console
- * outage: MCP servers come and go with every chat and fork, and an agent in
- * another window lost its live sessions twice because of it. So the recorder
- * became the durable thing and the MCP server became a thin client.
+ * The daemon owns the browser and the login; this owns everything about one
+ * console: getting it open, repairing its session, recording it, arbitrating
+ * input to it, and letting it go when nobody wants it.
  *
- * The daemon is the SINGLE AUTHORITY for its server, and that is what makes
- * session repair safe. Previously two parties could act on one server: killing
- * a stale session made someone else's recorder relaunch and then escalate to a
- * ~90-second Tunneled vKVM reset (observed live). With one authority per server
- * — enforced by a lock file — there is nobody left to fight.
+ * It is the SINGLE AUTHORITY for its server, and that is what makes session
+ * repair safe. Previously two parties could act on one server: killing a stale
+ * session made someone else's recorder relaunch and then escalate to a
+ * ~90-second Tunneled vKVM reset (observed live). The daemon keeps at most one
+ * recorder per server, so there is nobody left to fight.
  *
  * Everything a client needs to READ is on the filesystem (frames, state.json,
- * text.jsonl), so readers need no protocol and work even while the daemon is
- * busy. Only actions go through the control endpoint.
+ * text.jsonl), so readers need no protocol and work even while it is busy.
  */
 /** Born-dead launches before escalating to a Tunneled vKVM reset. */
 const BORN_DEAD_BEFORE_RESET = 2;
@@ -66,87 +63,63 @@ const MAX_TUNNELED_RESETS = 2;
  */
 const RECENT_USE_MS = 5 * 60 * 1000;
 
-export interface DaemonOptions {
+export interface ServerRecorderOptions {
   serverMoid: string;
   serverName?: string;
   objectType?: string;
   recording?: RecorderOptions;
   /** Total disk allowed across this server's frames before dormant data is dropped. */
   diskBudgetBytes?: number;
-  /** How often to evaluate lifetime and health. */
-  tickMs?: number;
-  /**
-   * What to do once teardown is complete. The process exits by default; tests
-   * pass their own so a shutdown does not take the test runner with it.
-   */
-  onStopped?: (reason: string) => void;
 }
 
-export class RecorderDaemon {
-  private readonly browser: BrowserService;
+export interface ServerRecorderHooks {
+  /** Called once teardown is complete, so the daemon can forget this recorder. */
+  onStopped: (serverMoid: string, reason: string) => void;
+  /** Where the daemon itself can be reached, for status reports. */
+  daemonInfo: () => { pid: number; port: number | null };
+}
+
+export type RecorderPhase = 'starting' | 'active' | 'dormant' | 'degraded' | 'stopped';
+
+export class ServerRecorder {
   private readonly arbiter = new InputArbiter();
-  private readonly control: ControlServer;
-  private readonly dir: string;
-  private lastClientContactAt: number | null = null;
+  /** A recorder is created because somebody wants it, which is contact in itself. */
+  private lastClientContactAt: number | null = Date.now();
   private readonly lastContactByClient = new Map<string, number>();
   private explicitKeepAliveUntil: number | null = null;
-  private lifecycleTimer: NodeJS.Timeout | null = null;
-  private phase: 'starting' | 'active' | 'dormant' | 'degraded' | 'stopped' = 'starting';
+  private phase: RecorderPhase = 'starting';
   private lastError: string | null = null;
   private degradedSince: number | null = null;
   private degradedAttempts = 0;
   private nextConsoleAttemptAt = 0;
   private stopping = false;
+  /** A tick can take a minute (a retry logs in and launches); ticks must not overlap. */
+  private ticking = false;
   /** Consecutive launches that came back already-ended, for reset escalation. */
   private bornDeadLaunches = 0;
   private tunneledResets = 0;
+  private readonly controlScope: ControlScope;
 
   constructor(
-    private readonly opts: DaemonOptions,
-    baseUrl: string,
-    recordingRoot: string,
-    /** Injectable so the console-establishment rules can be tested without Intersight. */
-    browser?: BrowserService
+    private readonly opts: ServerRecorderOptions,
+    private readonly browser: BrowserService,
+    private readonly dir: string,
+    private readonly hooks: ServerRecorderHooks
   ) {
-    this.browser = browser ?? new BrowserService(baseUrl);
-    // The recorder escalates to a Tunneled vKVM disable/re-enable when every
-    // relaunched console is born dead. Routed through the browser session, since
-    // the daemon holds no API key.
-    this.browser.setTunneledVkvmResetter(async (moid) => {
-      this.arbiter.setBusy('resetting Tunneled vKVM on the server', 120_000);
-      try {
-        await this.browser.resetTunneledVkvmViaSession(moid);
-      } finally {
-        this.arbiter.clearBusy();
-      }
-    });
-    this.dir = path.join(recordingRoot, opts.serverMoid);
-    this.control = new ControlServer({
+    const moid = opts.serverMoid;
+    this.controlScope = {
       arbiter: this.arbiter,
-      onClientContact: (clientId) => {
-        this.lastClientContactAt = Date.now();
-        // Per-client, so this recorder can tell "nobody wants me" from "someone
-        // else is depending on me right now". Old entries are dropped: every MCP
-        // restart mints a new client id, and only recent ones can veto a stop.
-        this.lastContactByClient.set(clientId, this.lastClientContactAt);
-        for (const [id, at] of this.lastContactByClient) {
-          if (this.lastClientContactAt - at > RECENT_USE_MS) {
-            this.lastContactByClient.delete(id);
-          }
-        }
-      },
       readActions: {
         status: async () => this.status(),
         keepAlive: async (p) => this.keepAlive(Number(p?.hours ?? 12)),
         // Reads of recorded frames are served here so a client never has to
         // know the on-disk layout, but they never need the input lease.
-        recent: async (p) =>
-          this.browser.getRecentFrames(this.opts.serverMoid, p?.count, p?.scale, p?.changesOnly),
-        timeline: async (p) => this.browser.getTimeline(this.opts.serverMoid, p?.minutesAgo, p?.minChangeRatio),
-        framesAt: async (p) => this.browser.getFramesAt(this.opts.serverMoid, p ?? {}),
-        findText: async (p) => this.browser.findTextInFrames(this.opts.serverMoid, p ?? {}),
-        exportFrames: async (p) => this.browser.exportFrames({ ...p, serverMoid: this.opts.serverMoid }),
-        screenshot: async (p) => this.browser.screenshot({ ...p, serverMoid: this.opts.serverMoid }),
+        recent: async (p) => this.browser.getRecentFrames(moid, p?.count, p?.scale, p?.changesOnly),
+        timeline: async (p) => this.browser.getTimeline(moid, p?.minutesAgo, p?.minChangeRatio),
+        framesAt: async (p) => this.browser.getFramesAt(moid, p ?? {}),
+        findText: async (p) => this.browser.findTextInFrames(moid, p ?? {}),
+        exportFrames: async (p) => this.browser.exportFrames({ ...p, serverMoid: moid }),
+        screenshot: async (p) => this.browser.screenshot({ ...p, serverMoid: moid }),
         // A dormant recorder wakes on demand rather than being kept alive.
         resume: async () => {
           await this.resume();
@@ -155,11 +128,11 @@ export class RecorderDaemon {
         // Stopping is NOT console input, so it must never queue behind the input
         // lease: one failed keystroke held the lease for 30s and made every stop
         // in that window fail with 409 — including a forced one — leaving a
-        // daemon nobody could kill. Peer etiquette is enforced inside instead.
+        // recorder nobody could kill. Peer etiquette is enforced inside instead.
         stop: async (p) => this.stopRequested(p ?? {}),
       },
       inputActions: {
-        sendKeys: async (p) => this.requireConsole().browser.sendKeys({ ...p, serverMoid: this.opts.serverMoid }),
+        sendKeys: async (p) => this.requireConsole().browser.sendKeys({ ...p, serverMoid: moid }),
         // Typing a whole line takes seconds at a safe cadence, and a verify pass
         // adds a screenshot plus OCR — so the lease is held with an ETA rather
         // than leaving a peer to guess why input is refused.
@@ -170,32 +143,29 @@ export class RecorderDaemon {
             estimateTypingMs(text, Number(p?.charDelayMs) || PASTE_CHAR_DELAY_MS) * 2 + 5000
           );
           try {
-            return await this.requireConsole().browser.pasteText({ ...p, text, serverMoid: this.opts.serverMoid });
+            return await this.requireConsole().browser.pasteText({ ...p, text, serverMoid: moid });
           } finally {
             this.arbiter.clearBusy();
           }
         },
-        mouse: async (p) => this.requireConsole().browser.mouse({ ...p, serverMoid: this.opts.serverMoid }),
-        pressUntil: async (p) => this.requireConsole().browser.pressUntil({ ...p, serverMoid: this.opts.serverMoid }),
-        wait: async (p) => this.requireConsole().browser.waitForFrame({ ...p, serverMoid: this.opts.serverMoid }),
-        watch: async (p) => this.requireConsole().browser.watch({ ...p, serverMoid: this.opts.serverMoid }),
+        mouse: async (p) => this.requireConsole().browser.mouse({ ...p, serverMoid: moid }),
+        pressUntil: async (p) => this.requireConsole().browser.pressUntil({ ...p, serverMoid: moid }),
+        wait: async (p) => this.requireConsole().browser.waitForFrame({ ...p, serverMoid: moid }),
+        watch: async (p) => this.requireConsole().browser.watch({ ...p, serverMoid: moid }),
         // Rebuild the console from scratch: the remedy when a live console
         // stops accepting input. Session repair happens inside, so the caller
         // never has to reason about orphaned sessions.
         relaunch: async () => {
           this.arbiter.setBusy('rebuilding the vKVM console', 120_000);
           try {
-            this.browser.stopRecording(this.opts.serverMoid);
-            await this.browser.closeKvm(this.opts.serverMoid).catch(() => {});
+            this.browser.stopRecording(moid);
+            await this.browser.closeKvm(moid).catch(() => {});
           } finally {
             this.arbiter.clearBusy();
           }
           try {
             await this.establishConsole();
-            this.phase = 'active';
-            this.lastError = null;
-            this.degradedSince = null;
-            this.degradedAttempts = 0;
+            this.markActive();
           } catch (error) {
             // The console was just torn down, so a failed rebuild leaves nothing
             // running. Saying 'active' here would be a lie the caller acts on.
@@ -205,51 +175,70 @@ export class RecorderDaemon {
           return this.status();
         },
       },
-    });
+    };
+  }
+
+  /** The actions a client may call on this server, with this server's own lease. */
+  scope(): ControlScope {
+    return this.controlScope;
+  }
+
+  currentPhase(): RecorderPhase {
+    return this.phase;
   }
 
   /**
-   * Take the server lock, establish the console, and start recording.
-   *
-   * Refuses politely when another live daemon already owns this server: the
-   * caller should use that one rather than compete, which is the whole point of
-   * one-recorder-per-server.
+   * Note that a client used this recorder. Per-client, so it can tell "nobody
+   * wants me" from "someone else is depending on me right now". Old entries are
+   * dropped: every MCP restart mints a new client id, and only recent ones can
+   * veto a stop.
    */
-  async start(): Promise<{ started: boolean; reason: string; controlPort?: number }> {
+  touch(clientId: string): void {
+    const now = Date.now();
+    this.lastClientContactAt = now;
+    this.lastContactByClient.set(clientId, now);
+    for (const [id, at] of this.lastContactByClient) {
+      if (now - at > RECENT_USE_MS) {
+        this.lastContactByClient.delete(id);
+      }
+    }
+  }
+
+  /**
+   * Somebody wants this console, so it must not go dormant yet — without naming
+   * them as a user of it. Asking for a recorder is not driving its console, and
+   * only clients driving it may veto another's stop.
+   */
+  noteInterest(): void {
+    this.lastClientContactAt = Date.now();
+  }
+
+  /**
+   * Start getting a console, in the background.
+   *
+   * A failure to establish it must NOT end the recorder. It stays, reports why in
+   * its status, and retries on the lifecycle tick — a console waiting on a human
+   * login is a recoverable state. Callers poll the phase to learn the outcome.
+   */
+  begin(): void {
     fs.mkdirSync(this.dir, { recursive: true });
-    const lock = acquireServerLock(this.dir);
-    if (!lock.acquired) {
-      return { started: false, reason: lock.reason };
-    }
+    void this.establishConsole().then(
+      () => this.markActive(),
+      (error) => this.markDegraded(error)
+    );
+  }
 
-    const port = await this.control.listen();
-    // Re-acquire purely to publish the port we just bound. If that write fails,
-    // refuse to run: an unreachable daemon would still open a console and hold
-    // the server's only session slot, invisibly — strictly worse than no daemon,
-    // since the next attempt could not even find it to take over.
-    const published = acquireServerLock(this.dir, { controlPort: port });
-    if (!published.acquired) {
-      await this.control.close().catch(() => {});
-      releaseLock(this.dir);
-      return { started: false, reason: `could not publish the control port: ${published.reason}` };
-    }
-
-    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
-    process.on('SIGINT', () => void this.shutdown('SIGINT'));
-
-    // A failure to establish the console must NOT kill the daemon. It stays up,
-    // reports why in its status, and retries on the lifecycle tick — a console
-    // waiting on a human login is a recoverable state, and a daemon that exits
-    // on it reintroduces exactly the fragility this design removes.
+  /**
+   * Run `fn` with this console marked busy, so input is refused with a reason
+   * rather than landing on a console being rebuilt underneath it.
+   */
+  async withBusy<T>(what: string, ms: number, fn: () => Promise<T>): Promise<T> {
+    this.arbiter.setBusy(what, ms);
     try {
-      await this.establishConsole();
-      this.phase = 'active';
-    } catch (error) {
-      this.markDegraded(error);
+      return await fn();
+    } finally {
+      this.arbiter.clearBusy();
     }
-    this.lifecycleTimer = setInterval(() => void this.lifecycleTick(), this.opts.tickMs ?? 60_000);
-    this.lifecycleTimer.unref?.();
-    return { started: true, reason: lock.reason, controlPort: port };
   }
 
   /**
@@ -261,32 +250,25 @@ export class RecorderDaemon {
    * buffered and arriving 90 seconds later on a screen that has changed.
    */
   private async establishConsole(): Promise<void> {
-    this.arbiter.setBusy('logging in to Intersight', 60_000);
-    try {
+    await this.withBusy('logging in to Intersight', 60_000, async () => {
       const login = await this.browser.ensureLoggedIn();
       if (!login?.loggedIn) {
         throw new Error(`could not establish an Intersight session: ${login?.reason ?? login?.error ?? 'unknown'}`);
       }
-    } finally {
-      this.arbiter.clearBusy();
-    }
+    });
 
     await this.clearBlockingSessions();
 
-    this.arbiter.setBusy('opening the vKVM console', 90_000);
-    let launch: any;
-    try {
-      launch = await this.browser.launchVkvm(
+    const launch = await this.withBusy('opening the vKVM console', 90_000, () =>
+      this.browser.launchVkvm(
         {
           moid: this.opts.serverMoid,
           objectType: this.opts.objectType ?? 'compute.RackUnit',
           name: this.opts.serverName,
         },
         { recording: this.opts.recording }
-      );
-    } finally {
-      this.arbiter.clearBusy();
-    }
+      )
+    );
     await this.verifyConsole(launch);
     // Whatever this directory claimed before, there is a live console now.
     this.clearDormantMarker();
@@ -297,11 +279,11 @@ export class RecorderDaemon {
    * recording it.
    *
    * launchVkvm reports these failures in its RESULT rather than by throwing, so
-   * a daemon that only caught exceptions reported phase 'active' while sitting
+   * a recorder that only caught exceptions reported phase 'active' while sitting
    * on a Forbidden page or an already-ended session — an agent would then watch
-   * for frames that were never coming. Two of these leave no recorder behind at
+   * for frames that were never coming. Two of these leave no capture behind at
    * all (autorecord is skipped for a dead console, and a REUSED tab only keeps
-   * the recorder that tab already had), so capture is asserted explicitly rather
+   * the capture that tab already had), so capture is asserted explicitly rather
    * than assumed.
    */
   private async verifyConsole(launch: any): Promise<void> {
@@ -312,22 +294,17 @@ export class RecorderDaemon {
     }
     if (launch?.sessionEnded) {
       this.bornDeadLaunches += 1;
-      // The same escalation the recorder uses for a console that dies right
+      // The same escalation the capture uses for a console that dies right
       // after mounting — reached here because a console that never mounts has
-      // no recorder to escalate on its behalf.
+      // no capture to escalate on its behalf.
       if (this.bornDeadLaunches >= BORN_DEAD_BEFORE_RESET && this.tunneledResets < MAX_TUNNELED_RESETS) {
         this.tunneledResets += 1;
         this.log(
           `console was born dead ${this.bornDeadLaunches}x; resetting Tunneled vKVM (${this.tunneledResets}/${MAX_TUNNELED_RESETS})`
         );
-        this.arbiter.setBusy('resetting Tunneled vKVM on the server', 120_000);
-        try {
-          await this.browser.resetTunneledVkvmViaSession(this.opts.serverMoid);
-        } catch (error) {
-          this.log(`Tunneled vKVM reset failed: ${(error as Error).message}`);
-        } finally {
-          this.arbiter.clearBusy();
-        }
+        await this.withBusy('resetting Tunneled vKVM on the server', 120_000, () =>
+          this.browser.resetTunneledVkvmViaSession(this.opts.serverMoid)
+        ).catch((error) => this.log(`Tunneled vKVM reset failed: ${(error as Error).message}`));
       }
       throw new Error(
         `the vKVM session ended immediately after opening. ${launch.hint ?? ''}`.trim()
@@ -336,8 +313,8 @@ export class RecorderDaemon {
     this.bornDeadLaunches = 0;
 
     // Autorecord can be off by environment, and a reused tab carries only the
-    // recorder it already had, so ask for capture explicitly. startRecording is
-    // idempotent: an already-running recorder keeps its frames.
+    // capture it already had, so ask for capture explicitly. startRecording is
+    // idempotent: an already-running capture keeps its frames.
     const rec = this.browser.startRecording(this.opts.serverMoid, this.opts.recording);
     if (rec && rec.recording === false) {
       throw new Error(`the console opened but nothing is recording it: ${rec.reason ?? 'unknown reason'}`);
@@ -349,8 +326,8 @@ export class RecorderDaemon {
    * nobody, and leave every other session strictly alone.
    *
    * This is the operation that used to be impossible to do safely. It is safe
-   * here only because this daemon holds the server lock: it is the single
-   * authority, so ending an orphan cannot start a fight with another recorder.
+   * here only because this recorder is the single authority for the server, so
+   * ending an orphan cannot start a fight with another recorder.
    */
   private async clearBlockingSessions(): Promise<void> {
     const sessions = await this.browser.activeKvmSessions(this.opts.serverMoid).catch(() => []);
@@ -369,8 +346,8 @@ export class RecorderDaemon {
         ourIamSessionMoid: identity?.iamSessionMoid ?? null,
         ourUserIdOrEmail: identity?.userIdOrEmail ?? null,
         hasAdoptableTab: adoptable,
-        // We hold the lock, so any recorder state on disk is ours; a live
-        // recorder elsewhere is impossible by construction here.
+        // The daemon keeps one recorder per server and this is it, so a live
+        // recorder elsewhere is impossible by construction.
         liveRecorderElsewhere: false,
         weAreTheAuthority: true,
         createdAt: s.createdAt,
@@ -380,14 +357,11 @@ export class RecorderDaemon {
         this.log(`leaving session ${s.moid} alone: ${verdict.reason}`);
         continue;
       }
-      this.arbiter.setBusy('ending an orphaned vKVM session', 30_000);
       try {
-        await this.browser.endKvmSession(s.moid);
+        await this.withBusy('ending an orphaned vKVM session', 30_000, () => this.browser.endKvmSession(s.moid));
         this.log(`ended orphaned session ${s.moid}: ${verdict.reason}`);
       } catch (error) {
         this.log(`could not end session ${s.moid}: ${(error as Error).message}`);
-      } finally {
-        this.arbiter.clearBusy();
       }
     }
   }
@@ -397,9 +371,9 @@ export class RecorderDaemon {
    *
    * A login that was impossible a minute ago (no browser session, a human
    * mid-MFA) may be possible now, so retrying is right. Retrying FOREVER is not:
-   * every attempt is a Cisco ID login and that path locks the account after
-   * three failures. Once nobody is asking any more, exiting is the better retry
-   * mechanism — the next client spawns a fresh daemon with a fresh browser.
+   * every attempt may be a Cisco ID login, and that path locks the account after
+   * three failures. Once nobody is asking any more, the recorder stops — the next
+   * client to want this console starts a fresh one.
    */
   private async retryDegradedConsole(): Promise<boolean> {
     const now = Date.now();
@@ -421,11 +395,7 @@ export class RecorderDaemon {
     }
     try {
       await this.establishConsole();
-      this.phase = 'active';
-      this.lastError = null;
-      this.degradedSince = null;
-      this.degradedAttempts = 0;
-      this.nextConsoleAttemptAt = 0;
+      this.markActive();
       this.log('console established on retry');
       return true;
     } catch (error) {
@@ -434,7 +404,21 @@ export class RecorderDaemon {
     }
   }
 
+  private markActive(): void {
+    if (this.stopping) {
+      return;
+    }
+    this.phase = 'active';
+    this.lastError = null;
+    this.degradedSince = null;
+    this.degradedAttempts = 0;
+    this.nextConsoleAttemptAt = 0;
+  }
+
   private markDegraded(error: unknown): void {
+    if (this.stopping) {
+      return;
+    }
     this.lastError = (error as Error)?.message?.slice(0, 300) ?? String(error);
     this.phase = 'degraded';
     this.degradedAttempts += 1;
@@ -454,12 +438,24 @@ export class RecorderDaemon {
   }
 
   /** Evaluate dormancy/expiry, and keep the console healthy while active. */
-  private async lifecycleTick(): Promise<void> {
-    if (this.stopping) {
+  async lifecycleTick(): Promise<void> {
+    if (this.stopping || this.ticking) {
       return;
     }
+    this.ticking = true;
+    try {
+      await this.tick();
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async tick(): Promise<void> {
     if (this.phase === 'degraded' && !(await this.retryDegradedConsole())) {
       return;
+    }
+    if (this.phase === 'starting') {
+      return; // the first attempt is still running; judge it when it lands
     }
 
     const rec = this.browser.recordingStatus(this.opts.serverMoid);
@@ -489,7 +485,7 @@ export class RecorderDaemon {
       this.phase = 'dormant';
       await this.releaseConsole();
       // Only actual dormancy publishes the marker. Teardown shares this release
-      // path, and a marker left by a clean shutdown made the NEXT daemon look
+      // path, and a marker left by a clean shutdown made the NEXT recorder look
       // dormant while it was recording happily.
       this.writeDormantMarker();
     }
@@ -506,7 +502,7 @@ export class RecorderDaemon {
   }
 
   /** Wake a dormant recorder because a client wants live capture again. */
-  private async resume(): Promise<void> {
+  async resume(): Promise<void> {
     if (this.phase === 'degraded') {
       // A client asking now is the best moment to try again, whatever the
       // backoff said: they may have just fixed what was broken.
@@ -520,9 +516,9 @@ export class RecorderDaemon {
     this.log("resuming from dormancy at a client's request");
     try {
       await this.establishConsole();
-      this.phase = 'active';
+      this.markActive();
     } catch (error) {
-      // A wake that fails must leave the daemon degraded-and-retrying rather
+      // A wake that fails must leave the recorder degraded-and-retrying rather
       // than dormant, or nothing will ever try again.
       this.markDegraded(error);
       throw error;
@@ -547,10 +543,10 @@ export class RecorderDaemon {
    * Stop this recorder — unless another agent is in the middle of using it.
    *
    * Nobody owns a recorder, which cuts both ways: it also means nobody gets to
-   * unilaterally destroy one. Stopping kills the daemon, ends the vKVM session
-   * and closes the tab, so doing it under a peer mid-installation causes exactly
-   * the outage this architecture was built to end. An unused recorder needs no
-   * stopping anyway — it goes dormant on its own and releases the console.
+   * unilaterally destroy one. Stopping ends the vKVM session and closes the tab,
+   * so doing it under a peer mid-installation causes exactly the outage this
+   * architecture was built to end. An unused recorder needs no stopping anyway —
+   * it goes dormant on its own and releases the console.
    */
   private stopRequested(p: Record<string, unknown>): { stopping: boolean; reason: string } {
     const asker = String(p.clientId ?? 'unknown-client');
@@ -567,7 +563,7 @@ export class RecorderDaemon {
         );
       }
     }
-    // Answer before exiting, so the caller does not see a dropped socket.
+    // Answer before tearing down, so the caller does not see a dropped request.
     const reason = p.force ? `client ${asker} forced a stop` : `client ${asker} asked this recorder to stop`;
     setTimeout(() => void this.shutdown(reason), 50);
     return { stopping: true, reason };
@@ -579,14 +575,15 @@ export class RecorderDaemon {
     return { keepAliveUntil: new Date(this.explicitKeepAliveUntil).toISOString() };
   }
 
-  private status(): any {
+  status(): any {
     const rec = this.browser.recordingStatus(this.opts.serverMoid);
+    const daemon = this.hooks.daemonInfo();
     return {
       serverMoid: this.opts.serverMoid,
       serverName: this.opts.serverName ?? null,
-      daemonPid: process.pid,
+      daemonPid: daemon.pid,
       phase: this.phase,
-      controlPort: this.control.port(),
+      controlPort: daemon.port,
       lastClientContactAt: this.lastClientContactAt ? new Date(this.lastClientContactAt).toISOString() : null,
       dormantAfterHours: Math.round(DORMANCY_AFTER_MS / 3600_000),
       dataExpiresAfterHours: Math.round(DATA_EXPIRY_MS / 3600_000),
@@ -606,7 +603,7 @@ export class RecorderDaemon {
   }
 
   private writeDormantMarker(): void {
-    // Recorded in the state file so a client sees "dormant, resumable" rather
+    // Recorded beside the frames so a client sees "dormant, resumable" rather
     // than a recorder that merely went quiet.
     try {
       const file = path.join(this.dir, 'dormant.json');
@@ -627,18 +624,17 @@ export class RecorderDaemon {
     }
   }
 
-  private async shutdown(reason: string, opts: { deleteData?: boolean } = {}): Promise<void> {
+  /**
+   * Release this server's console and forget it. Never touches the browser: it
+   * belongs to the daemon and every other recorder is using it.
+   */
+  async shutdown(reason: string, opts: { deleteData?: boolean } = {}): Promise<void> {
     if (this.stopping) {
       return;
     }
     this.stopping = true;
-    this.log(`shutting down: ${reason}`);
-    if (this.lifecycleTimer) {
-      clearInterval(this.lifecycleTimer);
-    }
+    this.log(`stopping: ${reason}`);
     await this.releaseConsole().catch(() => {});
-    await this.control.close().catch(() => {});
-    await this.browser.close().catch(() => {});
     if (opts.deleteData) {
       try {
         fs.rmSync(this.dir, { recursive: true, force: true });
@@ -646,26 +642,21 @@ export class RecorderDaemon {
         /* best effort */
       }
     } else {
-      releaseLock(this.dir);
-      // A stopped daemon is gone, not resting; leaving the marker would offer
+      // A stopped recorder is gone, not resting; leaving the marker would offer
       // the next client something to resume that does not exist.
       this.clearDormantMarker();
     }
     this.phase = 'stopped';
-    // Exiting is the entry point's decision, not the daemon's: a shutdown that
-    // called process.exit itself could not be tested.
-    (this.opts.onStopped ?? (() => process.exit(0)))(reason);
+    this.hooks.onStopped(this.opts.serverMoid, reason);
   }
 
-  /** stderr, so it lands in whatever log the spawner redirected to. */
   /**
-   * Timestamped, because this log is the only account of an overnight run: a
-   * line reading "went dormant" is useless without knowing when.
+   * Timestamped, because the daemon log is the only account of an overnight
+   * run: a line reading "went dormant" is useless without knowing when.
    */
   private log(message: string): void {
-    console.error(`${new Date().toISOString()} [recorder ${this.opts.serverMoid} pid ${process.pid}] ${message}`);
+    console.error(`${new Date().toISOString()} [recorder ${this.opts.serverMoid}] ${message}`);
   }
-
 }
 
 function toMs(iso: unknown): number | null {

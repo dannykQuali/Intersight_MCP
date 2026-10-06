@@ -20,79 +20,61 @@
  * SOFTWARE.
  */
 
+import type { LaunchOptions } from 'playwright-core';
+
 /**
- * How to get hold of the shared browser, and what must never be done to it.
+ * The browser belongs to the account daemon alone.
  *
- * These rules exist because their absence cost an agent its console. Two vKVM
- * renderers were wedged by a `beforeunload` dialog, so Playwright's attach —
- * which attaches to EVERY page — hung and timed out. The failed attach fell
- * through to "spawn a browser", whose first act was to delete the profile's
- * DevToolsActivePort: the live browser's own port file, and the only way anyone
- * discovers it. Edge then launched onto an in-use profile, handed its about:blank
- * to the running browser and exited without writing a new port file, so the spawn
- * threw and every retry repeated the cycle — discovery permanently broken, one
- * stray blank tab per attempt.
+ * It used to be a detached browser on a shared profile, published through a
+ * DevTools port file so that any process could attach to it. That openness is
+ * what let a second party into the daemon's cookie jar: an MCP server still
+ * running an old build stayed attached with its own login and keepalive, and
+ * its Cisco ID login collided with the daemon's ("OIDC state parameter is
+ * invalid") even with only one daemon running. The shared design also carried a
+ * long tail of attach hazards — a wedged page stalling every attach, a spawn
+ * deleting a live browser's port file, a launch onto a held profile donating a
+ * blank tab and exiting.
  *
- * The missing rule, in one line: a browser that ANSWERS is present, however badly
- * it is behaving, and a port file must never be deleted while something is
- * listening on it.
+ * Now the daemon launches the browser itself and drives it over a pipe. There
+ * is no port and no port file, so there is nothing to attach to, and the one
+ * daemon per account (enforced by its own listening port) is the only process
+ * that ever holds this profile. The browser lives exactly as long as the daemon.
  */
 
-export interface AcquisitionFacts {
-  /** Endpoint read from the profile's port file, or null when there is none. */
-  endpointFromFile: string | null;
-  /** Does something answer on that endpoint right now? */
-  endpointAnswers: boolean;
-  /** Did an attach to it already fail this round? */
-  attachFailed?: boolean;
-  /** Is a browser process already holding this profile? */
-  profileInUse?: boolean;
-}
+/** The daemon's private profile, beside the recordings in ~/.intersight-mcp. */
+export const DAEMON_PROFILE_DIR = 'daemon-browser-profile';
 
-export interface AcquisitionDecision {
-  action: 'attach' | 'retry-attach' | 'spawn';
-  /** Only ever true for a port file nobody is listening on. */
-  removeStalePortFile: boolean;
-  reason: string;
-}
+/**
+ * The shared profile older builds attach to. Never used by the daemon: an old
+ * MCP server still running would find the daemon's browser through it.
+ */
+export const LEGACY_SHARED_PROFILE_DIR = 'browser-profile';
 
-export function decideBrowserAcquisition(facts: AcquisitionFacts): AcquisitionDecision {
-  const { endpointFromFile, endpointAnswers, attachFailed, profileInUse } = facts;
-
-  if (endpointFromFile && endpointAnswers) {
-    // A hung or failed attach is evidence of a browser, not of its absence — a
-    // single wedged page is enough to stall Playwright's attach to all of them.
-    return attachFailed
-      ? {
-          action: 'retry-attach',
-          removeStalePortFile: false,
-          reason:
-            'a browser is listening on the published port, so it exists even though attaching just failed — ' +
-            'retrying beats spawning a competitor and orphaning it',
-        }
-      : { action: 'attach', removeStalePortFile: false, reason: 'the published endpoint answers' };
-  }
-
-  if (profileInUse) {
-    // Launching onto a locked profile does not start a browser: the new process
-    // hands its URL to the running one and exits, leaving a stray tab and no port
-    // file. Waiting for the existing browser to become attachable is the only
-    // thing that can work.
-    return {
-      action: 'retry-attach',
-      removeStalePortFile: false,
-      reason:
-        'the profile is already in use by a running browser, which would swallow a launch and leave a stray tab — ' +
-        'wait for it to become attachable instead',
-    };
-  }
-
+/** Options for `chromium.launchPersistentContext` on the daemon's own browser. */
+export function ownedBrowserLaunchOptions(
+  executablePath: string,
+  size: { width: number; height: number } = { width: 1600, height: 900 }
+): LaunchOptions & { viewport: null } {
   return {
-    action: 'spawn',
-    removeStalePortFile: !!endpointFromFile,
-    reason: endpointFromFile
-      ? 'the published port answers nothing, so that file is stale and safe to clear before launching'
-      : 'no browser is published for this profile and none is running',
+    executablePath,
+    // Visible: the vKVM client renders into it, and a human may need to finish
+    // an MFA prompt when automatic login cannot.
+    headless: false,
+    // The real window size, not an emulated viewport, so a screenshot and a
+    // mouse coordinate mean the same thing.
+    viewport: null,
+    // Playwright would otherwise mark the browser as automated. The detached
+    // browser this replaces was an ordinary one to every page it loaded,
+    // including the SSO pages, and that is kept.
+    ignoreDefaultArgs: ['--enable-automation'],
+    // NO --remote-debugging-port: Playwright drives it over a pipe, which is the
+    // whole point.
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      `--window-size=${size.width},${size.height}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
   };
 }
 

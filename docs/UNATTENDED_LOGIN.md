@@ -4,10 +4,12 @@ Intersight browser sessions expire (idle timeout, and an absolute lifetime). For
 
 Two mechanisms work together:
 
-1. **Keepalive** — a periodic authenticated API ping (default every 240s) counts as activity against the idle timeout.
-2. **Automatic re-login** — when the ping comes back 401, the server drives the Cisco ID (Okta) SSO flow itself: username → password → TOTP → account chooser. Also runs on demand.
+1. **Keepalive** — a periodic authenticated API ping (default every 240s) counts as activity against the idle timeout. It only pings; it never logs in.
+2. **Automatic login** — when a recorder needs its console and the session is proven gone, the daemon drives the Cisco ID (Okta) SSO flow itself, **once**: username → password → TOTP → account chooser.
 
 Both are off unless credentials are configured. Nothing changes for interactive use.
+
+**Every web login is rationed** — see [The login policy](#the-login-policy-one-attempt-proof-and-a-recorder) below. Bursts of automated logins locked this account out of Intersight twice in a month, and each time the way back was an administrator removing and re-adding the user, which also revokes every API key. So: one attempt per need and never a retry; no login until the session is proven gone; no login at all unless a recorder needs a console.
 
 ## Configuration
 
@@ -48,12 +50,12 @@ The `totp` value is exactly the `otpauth://` URI your authenticator app was enro
 
 ## Usage
 
-- `browser_open` — logs in automatically when credentials are configured, then starts the keepalive. Its result includes an `autoLogin` block (see below).
-- `browser_login {force?}` — ensure a session on demand; `force: true` re-runs the flow even if the session still looks valid.
-- `browser_status` — includes the same `autoLogin` block: `configured`, `enabled`, `credentialSource`, masked `username`, `totpConfigured`, `accountName`, `keepaliveSeconds`, `keepaliveRunning`, `logins`, `lastLoginAt`, `lastKeepalive`.
-- `launch_vkvm_session` — if the session has expired it now **self-heals** (re-login) instead of failing, so an overnight run recovers on its own.
+- `browser_open` — opens the window at Intersight. It logs in automatically only when a recorder is active and the session is proven gone; otherwise the window is left for a human to log in. Its result includes an `autoLogin` block (see below) and, when a login was attempted or refused, `autoLoginResult` with the reason.
+- `browser_login {force?}` — ensure a session on demand: **at most one** Cisco ID attempt per call, and only when a recorder is active and the session is proven gone. After a failed attempt automatic login is disarmed, and this call is the one way to try once more. It never re-logs-in over a valid session — `force` is accepted for compatibility and means the same thing. Do not call it in a loop: if it fails, a human has to look.
+- `browser_status` — includes the `autoLogin` block: `configured`, `enabled`, `credentialSource`, masked `username`, `totpConfigured`, `accountName`, `keepaliveSeconds`, `keepaliveRunning`, `logins`, `lastLoginAt`, `lastKeepalive`, `autoLoginDisabledReason`, and `loginPolicy` (`armed`, `lastAttempt`, `attempts`, `failuresSinceSuccess`, `activeRecorders`).
+- `launch_vkvm_session` / `vkvm_record_start` — a recorder that finds the session gone logs in **once** on its own; if that fails it reports `consoleProblem` with the policy's reason and keeps the recorder (degraded) without logging in again.
 
-A typical overnight setup: configure the credentials file, start the run, and the agent calls `browser_open` once. No human step required. Without credentials the behavior is unchanged — a human logs in in the visible window and the session persists in the browser profile.
+A typical overnight setup: configure the credentials file and start the recorders; the first one to need a console logs in. No human step required. Without credentials the behavior is unchanged — a human logs in in the visible window and the session persists in the browser profile.
 
 ## Secrets handling
 
@@ -89,14 +91,22 @@ Two caveats still hold:
 A TOTP code is valid once. Two processes authenticating within the same 30-second window generate the *same* code, and the second is rejected — surfacing as the generic "no valid Intersight session was detected". Two harnesses starting ~15s apart reproduced this reliably, while sequential logins never failed.
 
 Mitigations in place:
-- Multiple MCP server instances **share one browser** (CDP attach), so normally only one login happens at all.
-- A failed login is retried once after waiting into a **fresh TOTP window** (`loginWithTotpRetry`). The pair counts as a single attempt against the lockout breaker, since it is one login intent.
+- Exactly one process ever logs in: the account daemon owns the only browser (see below), so there is nothing to collide with.
+- There is **no retry** any more. A failed login used to be retried once in a fresh TOTP window; that retry is gone with the rest of the retries (see the policy below). If a code is rejected as already used, the attempt simply fails and a human decides.
 
-If you script your own logins against the same credentials, stagger them by more than 30s.
+If you script your own logins against the same credentials, stagger them by more than 30s — and know that every login you add is one more toward a lockout.
 
-## Account-lockout guard
+## The login policy: one attempt, proof, and a recorder
 
-A keepalive loop retrying a wrong password every few minutes all night would lock the Cisco ID account. So auto-login **self-disables after 3 consecutive failures**: the keepalive stops, and `browser_status` reports `consecutiveFailures` and `autoLoginDisabledReason`. Fix the credentials and call `browser_login` with `force: true` (or log in manually) to re-arm — a successful login also resets the counter.
+Two lockouts in a month changed what "robust" means here. On 2026-09-26 several processes logged in against each other (~1,050 attempts in a morning, see below); on 2026-10-21 it happened again, with only a handful of attempts. Each time Intersight stopped creating sessions for the user, the way back was an administrator removing and re-adding the user to the account, and that revokes every API key the user had — a day of reconfiguration, and the vKVM tools unusable until then. The lesson is that the number of logins is the risk, so the daemon rations them ([src/services/loginPolicy.ts](../src/services/loginPolicy.ts)):
+
+1. **One attempt per need, never a retry.** Any failed attempt — credential or mechanical, it makes no difference to Intersight — **disarms** automatic login. Recorders keep running (degraded, retrying their console on the usual backoff) but no longer log in; `browser_status` shows `autoLoginDisabledReason` and `loginPolicy.lastAttempt`. The one way to try again is an explicit `browser_login`, which is itself a single attempt. A success re-arms.
+2. **No login until the session is proven gone.** Before any attempt the daemon gathers evidence: an authenticated API ping that answers 2xx means *valid* (no login); a 401 is only a candidate, because the bare `intersight.com` origin always 401s — the daemon then navigates a non-console tab to an app route, and only the **sign-in page** showing is *proven-logged-out*. Anything else (a network error, a 5xx, an app page whose API still 401s) is *unknown*, and the daemon refuses to log in over a possibly valid session. `browser_login` returns the `evidence` it found.
+3. **No recorder needing a console, no login.** The daemon tells the browser how many recorders are in phase `starting`, `active` or `degraded` (dormant and stopped recorders have released their console). When that is zero, every login — recorder, keepalive, `browser_open`, `browser_login` — is refused with a reason that says how a login does happen: start a recorder. When no browser is even open, the daemon does not launch one to find out.
+
+The keepalive therefore only pings. If a ping fails it is logged once and reported in `lastKeepalive`; the next recorder that needs its console gathers the evidence and, if the session really is gone, logs in once.
+
+What to do when `loginPolicy.armed` is `false`: look at `lastAttempt.error` and the `login-failure-*.png` screenshot, fix the cause, then call `browser_login` once — or log in manually in the daemon's browser window, which the recorders pick up on their next retry without any login of their own.
 
 ## Hard-won details of the Cisco ID flow (validated live 2026-07-28)
 
@@ -112,7 +122,6 @@ Diagnostics: every login records a URL trail in `stepsCompleted`, and a failure 
 ## Robustness notes
 
 - The flow matches form fields from **candidate selector lists** (Okta variants: `input[name="identifier"]`, `#okta-signin-username`, `input[type="email"]`, …) rather than one hardcoded selector, and falls back to pressing Enter when no submit button matches. Cisco's login UI still changes; if a step stops matching, the debug screenshot shows where, and the fix is to add a selector to the relevant list in `performCiscoIdLogin()`.
-- If a TOTP code is rejected as already-used, it waits for the next 30s window and retries once.
 - After a re-login, vKVM tabs from the dead session are closed automatically (their consoles are useless), so the agent relaunches instead of screenshotting a dead console.
 - Concurrent callers share a single in-flight login attempt (no double submission). That guard only works **within one process**, which is why exactly one process ever logs in — see below.
 - The keepalive timer is `unref`'d, so it never keeps the process alive on its own.
@@ -125,7 +134,7 @@ That is what happened on 2026-09-26, when every server had its own recorder daem
 
 If you see the OIDC error again, look for a second process driving the same browser profile: an MCP server still running an old build, a legacy per-server daemon (`recorder.lock` files under `~/.intersight-mcp/recordings/`), or a script of your own.
 
-**Status:** validated live 2026-07-28 — a cold automated login from a fresh browser profile completed the whole Cisco ID chain (including TOTP and the 3-account chooser) and ended authenticated on the regional host. TOTP generation is verified against the RFC 6238 test vectors; credential loading, masking, the no-credentials path, and the lockout guard are verified too.
+**Status:** validated live 2026-07-28 — a cold automated login from a fresh browser profile completed the whole Cisco ID chain (including TOTP and the 3-account chooser) and ended authenticated on the regional host. TOTP generation is verified against the RFC 6238 test vectors; credential loading, masking, the no-credentials path, and the login policy ([loginPolicy.test.ts](../test/loginPolicy.test.ts), [loginGate.test.ts](../test/loginGate.test.ts)) are verified too.
 
 ## Never click the Cisco ID button before the page is ready
 
@@ -168,48 +177,30 @@ overlay can intercept that, and by then the button is enabled so the click means
 something. Clicking a still-disabled button is explicitly refused: it would do
 nothing while looking like success.
 
-## The lockout guard counts credentials, not mechanical failures
+## Failure kinds: credential or mechanical (a label, no longer a budget)
 
-Automatic login disarms itself after three consecutive failures. That guard has
-exactly one purpose — stop a wrong password being retried until the Cisco ID
-account locks — so it must only count attempts that could actually cause a
-lockout.
+Every failed attempt is still classified by how far it got
+([loginFailureClassification.ts](../src/utils/loginFailureClassification.ts)),
+and the result is reported as `failureKind` in the login result and in
+`loginPolicy.lastAttempt`:
 
-It used to count everything. On 2026-08-24 a recorder failed twice for reasons
-that never sent a credential to anyone (`locator.click: Timeout 30000ms exceeded`
-on a still-disabled button, then `Could not find the username field`) and the
-guard duly reported:
-
-```
-Intersight auto-login disabled after 3 consecutive failures.
-```
-
-The account had never been touched, and the daemon had just switched off the one
-mechanism that could recover it — so it sat `degraded`, with no console, retrying
-a login it had itself disabled.
-
-The dividing line is **credential submission**
-([loginFailureClassification.ts](../src/utils/loginFailureClassification.ts)):
-
-| How far the attempt got | Counts toward lockout? |
+| How far the attempt got | `failureKind` |
 |---|---|
-| Page never loaded, button not clickable, username field missing | **No** — mechanical |
-| Username submitted (identifier-first IdP discovery) | **No** — nothing is verified, no sign-in fails |
-| **Password submitted** | **Yes** |
-| **TOTP / MFA submitted** | **Yes** |
-| Failure at the account chooser, after Cisco ID accepted us | No — an Intersight problem, not a credential one |
+| Page never loaded, button not clickable, username field missing | mechanical |
+| Username submitted (identifier-first IdP discovery) | mechanical — nothing was verified |
+| **Password submitted** | credential |
+| **TOTP / MFA submitted** | credential |
+| Failure at the account chooser, after Cisco ID accepted us | mechanical — an Intersight problem, not a credential one |
 
-Mechanical failures are counted separately as `mechanicalFailures`, reported in
-`browser_status`, retried freely, and logged with the exemption stated in the same
-line — because "auto-login failed (1/3)" printed next to a click timeout is
-exactly what made the old behaviour look reasonable:
-
-```
-Intersight auto-login failed before any credential was sent (mechanical failure 1,
-lockout budget untouched at 0/3): locator.click: Timeout 30000ms exceeded —
-no credential was submitted, so this failure cannot lock the Cisco ID account
-and is not counted toward the auto-login lockout guard.
-```
+Until 2026-10 this was a budget: only credential failures counted toward a
+three-strike guard, and mechanical ones were "retried freely". That was the right
+call for the Cisco ID password lockout it was designed around, and the wrong one
+for what actually locked the account: Intersight's own limit on logins. On
+2026-09-26, ~950 of the ~1,050 attempts were mechanical — none sent a credential,
+none counted, all of them counted. So now **any** failure disarms automatic login
+(see the policy above), and the classification only tells the reader where the
+attempt broke: a mechanical failure points at the page (inspect the screenshot and
+`stepsCompleted`), a credential failure points at the credentials.
 
 ## The sign-in page asks for the email first (redesign, 2026-08-24)
 

@@ -16,6 +16,7 @@ import type { BrowserService } from '../../src/services/browserService.js';
 
 const browser = {
   setTunneledVkvmResetter: () => {},
+  setRecorderCensus: () => {},
   ensureLoggedIn: async () => ({ loggedIn: true }),
   activeKvmSessions: async () => [],
   currentSessionIdentity: async () => ({ iamSessionMoid: 'iam-1', userIdOrEmail: 'me@example.com' }),

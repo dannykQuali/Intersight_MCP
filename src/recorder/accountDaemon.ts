@@ -102,7 +102,10 @@ export class AccountDaemon {
         // Browser and login work for the MCP server's own tools. They run here
         // because this is the one process with the browser: an MCP server that
         // logged in by itself would be a second login in the same cookie jar.
-        login: async (p) => this.requireBrowser().ensureLoggedIn({ force: !!p?.force }),
+        // browser_login is the explicit request — the one thing that may re-arm
+        // automatic login after a failure, for exactly one more attempt. A
+        // recorder's own login never says 'explicit'.
+        login: async (p) => this.requireBrowser().ensureLoggedIn({ trigger: 'explicit', force: !!p?.force }),
         browserOpen: async (p) =>
           this.requireBrowser().open(
             p?.url,
@@ -129,6 +132,9 @@ export class AccountDaemon {
     }
 
     this.browser = this.opts.browserFactory ? this.opts.browserFactory() : new BrowserService(this.opts.baseUrl);
+    // The login policy refuses every web login while no recorder needs a
+    // console, so the browser must always know how many do.
+    this.browser.setRecorderCensus(() => this.recordersNeedingConsole());
     // A console that keeps coming back dead gets a Tunneled vKVM reset. Only
     // THAT server is marked busy for its ~90s: every other console shares this
     // process, and blocking their input for a reset elsewhere would be new harm.
@@ -182,7 +188,28 @@ export class AccountDaemon {
       startedAt: this.startedAt.toISOString(),
       lastClientContactAt: new Date(this.lastClientContactAt).toISOString(),
       recorders: [...this.recorders.entries()].map(([serverMoid, r]) => ({ serverMoid, phase: r.currentPhase() })),
+      recordersNeedingConsole: this.recordersNeedingConsole(),
     };
+  }
+
+  /**
+   * How many recorders need a console right now — the census the login policy
+   * reads, and the only thing that ever justifies a web login.
+   *
+   * Starting, active and degraded recorders count: a degraded one is exactly
+   * the one still trying to get its console. Dormant and stopped ones have
+   * released their console and must NOT count — a dormant daemon logging in
+   * every four minutes was one of the loops in the 26-Sep lockout.
+   */
+  private recordersNeedingConsole(): number {
+    let n = 0;
+    for (const recorder of this.recorders.values()) {
+      const phase = recorder.currentPhase();
+      if (phase === 'starting' || phase === 'active' || phase === 'degraded') {
+        n++;
+      }
+    }
+    return n;
   }
 
   /**

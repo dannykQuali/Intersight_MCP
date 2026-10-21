@@ -96,17 +96,24 @@ export function fakeBrowser(opts: FakeBrowserOpts) {
     keys: 0,
     logins: 0,
     loginForced: [] as boolean[],
+    /** Every option object ensureLoggedIn was called with, in order. */
+    loginOpts: [] as Array<Record<string, unknown>>,
     browserClosed: 0,
     endedSessions: [] as string[],
   };
   let resetter: ((moid: string) => Promise<unknown>) | null = null;
+  let census: (() => number) | null = null;
   const browser = {
     setTunneledVkvmResetter: (fn: (moid: string) => Promise<unknown>) => {
       resetter = fn;
     },
-    ensureLoggedIn: async (o?: { force?: boolean }) => {
+    setRecorderCensus: (fn: () => number) => {
+      census = fn;
+    },
+    ensureLoggedIn: async (o?: { force?: boolean; trigger?: string }) => {
       calls.logins++;
       calls.loginForced.push(!!o?.force);
+      calls.loginOpts.push({ ...(o ?? {}) });
       return { loggedIn: true };
     },
     status: async () => ({ browserOpen: true, loggedIn: true, pages: [], kvmSessions: [] }),
@@ -150,6 +157,8 @@ export function fakeBrowser(opts: FakeBrowserOpts) {
     calls,
     /** The Tunneled vKVM resetter the daemon registered with its browser. */
     resetter: () => resetter,
+    /** How many recorders the daemon says need a console right now, or null if it never said. */
+    census: () => (census ? census() : null),
   };
 }
 

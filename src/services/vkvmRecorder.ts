@@ -696,7 +696,8 @@ export class VkvmRecorder {
     } catch (error) {
       this.recoveryFailures++;
       // 30s, 60s, 120s ... capped at 5 minutes. Keeps trying all night without
-      // hammering (the login circuit breaker separately guards the account).
+      // hammering. A retry here never repeats a web login: the login policy
+      // allows one attempt per need and refuses the rest until re-armed.
       const backoff = Math.min(300000, this.opts.recoveryBackoffMs * 2 ** (this.recoveryFailures - 1));
       this.nextRecoveryAt = Date.now() + backoff;
       this.state = 'failed';

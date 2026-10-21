@@ -3564,7 +3564,7 @@ export class IntersightMCPServer {
       // drive a visible browser in which a human logs into Intersight once.
       {
         name: 'browser_open',
-        description: 'Open a visible (non-headless) browser window with a persistent profile and navigate to the Intersight login page. The user completes the SSO/MFA login interactively; the session is then available to all other browser_/vkvm tools. Returns loggedIn=true immediately if cookies from a previous login are still valid.',
+        description: 'Open a visible (non-headless) browser window with a persistent profile and navigate to the Intersight login page. The user completes the SSO/MFA login interactively; the session is then available to all other browser_/vkvm tools. Returns loggedIn=true immediately if cookies from a previous login are still valid. It logs in automatically only when a recorder is active for some server and the session is proven gone (the sign-in page is showing); otherwise the window is left open for a human to log in manually.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -3585,7 +3585,7 @@ export class IntersightMCPServer {
       },
       {
         name: 'browser_status',
-        description: 'Report the browser state: whether it is open, whether the Intersight user session is logged in, the open tabs, the active vKVM sessions, and the automatic-login/keepalive status (configured, enabled, last login, last keepalive). Poll this after browser_open to wait for the user to finish logging in.',
+        description: 'Report the browser state: whether it is open, whether the Intersight user session is logged in, the open tabs, the active vKVM sessions, and the automatic-login/keepalive status (configured, enabled, last login, last keepalive; autoLogin.loginPolicy reports whether automatic login is armed, the lastAttempt, and activeRecorders). Poll this after browser_open to wait for the user to finish logging in.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -3593,13 +3593,13 @@ export class IntersightMCPServer {
       },
       {
         name: 'browser_login',
-        description: 'Ensure a valid Intersight session, logging in automatically via Cisco ID (username + password + TOTP) if credentials are configured. Use for unattended/overnight runs so a session timeout does not blind the agent; also starts the session keepalive that re-logs-in on expiry. Returns loggedIn plus which steps completed. Never returns secrets. If credentials are not configured it says so and a human must log in in the browser window.',
+        description: 'Ensure a valid Intersight session. Logs in via Cisco ID (username + password + TOTP, if credentials are configured) at most ONCE per call, and only when a recorder is active for some server AND the session is proven gone (the sign-in page is showing). A web login is a liability: bursts of them have locked this account out of Intersight. After a failed attempt automatic login is disarmed, and this call is the one way to try once more. It never re-logs-in over a valid session. Returns loggedIn, evidence, loginPolicy and stepsCompleted. Never returns secrets. Do not call it in a loop — if it fails, a human has to look.',
         inputSchema: {
           type: 'object',
           properties: {
             force: {
               type: 'boolean',
-              description: 'Re-run the login flow even if the current session still looks valid (default: false)',
+              description: 'Re-arms automatic login after a failed attempt and tries once — the same as calling without it; kept for compatibility. Never re-runs the flow over a session that is still valid.',
             },
           },
         },

@@ -21,26 +21,22 @@
  */
 
 /**
- * Did a failed login attempt actually put the Cisco ID account at risk?
+ * How far did a failed login attempt get — did it submit a credential at all?
  *
- * The three-strike auto-login guard exists for exactly one purpose: stop a wrong
- * password being retried until the account locks. It therefore has no business
- * counting failures where no credential was ever sent.
+ * This is a LABEL, not a budget. It used to drive a three-strike guard that
+ * counted only credential failures and let "mechanical" ones (the page not
+ * loading, a button not clickable, a field not found) retry freely — the right
+ * idea for the Cisco ID password lockout it was designed around, and the wrong
+ * one for what actually locked the account: Intersight's own limit on logins,
+ * which counts every attempt the same. ~950 of the ~1,050 attempts on
+ * 2026-09-26 were mechanical. So now every failure disarms automatic login (see
+ * loginPolicy.ts), and the classification only tells the reader where to look:
+ * a mechanical failure points at the page (screenshot, stepsCompleted), a
+ * credential failure points at the credentials.
  *
- * It did, and the cost was real. On 2026-08-24 a recorder failed twice for
- * mechanical reasons — `locator.click: Timeout 30000ms exceeded` (the Sign In
- * button was still `disabled` under the page's loading overlay) and then
- * `Could not find the username field` — and the guard disarmed automatic login:
- *
- *   Intersight auto-login disabled after 3 consecutive failures.
- *
- * The account had never been touched, and the daemon had just switched off the
- * one thing that could recover it, so it sat degraded with no console.
- *
- * The dividing line is credential submission. Everything before it (the page not
- * loading, a button not clickable, a field not found, even the username being
- * submitted for IdP discovery) is mechanical: retry freely, spend no budget. From
- * the password onwards, count it — that is what a lockout policy counts.
+ * The dividing line is credential submission. Everything before it, even the
+ * username being submitted for IdP discovery, is mechanical: no sign-in was
+ * verified and none failed.
  */
 
 /** How far into authentication an attempt actually got. */
@@ -63,7 +59,7 @@ export function loginAttemptReach(steps: readonly string[]): LoginAttemptReach {
 }
 
 /**
- * Should this failure count against the lockout guard?
+ * Could this failure have counted against the Cisco ID account's own lockout?
  *
  * Only when a credential was submitted in THIS attempt. A failure at the account
  * chooser, for instance, happens after Cisco ID has already accepted us — it is
@@ -74,17 +70,16 @@ export function countsTowardAccountLockout(steps: readonly string[]): boolean {
 }
 
 /**
- * Why a failure was exempted, for the log line — or null when it does count.
- *
- * Worth spelling out: "auto-login failed (1/3)" next to a click timeout is what
- * made the original behaviour look reasonable.
+ * Why a failure is labelled mechanical, for the log line — or null when a
+ * credential was submitted. The label changes nothing about what happens next
+ * (every failure disarms automatic login); it tells the reader where to look.
  */
 export function lockoutExemptionReason(steps: readonly string[]): string | null {
   if (countsTowardAccountLockout(steps)) {
     return null;
   }
   return (
-    'no credential was submitted, so this failure cannot lock the Cisco ID account ' +
-    'and is not counted toward the auto-login lockout guard'
+    'no credential was submitted, so the Cisco ID account itself was not touched; ' +
+    'the failure is in the page or the flow (see the screenshot and stepsCompleted)'
   );
 }

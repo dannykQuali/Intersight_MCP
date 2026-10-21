@@ -593,8 +593,8 @@ A reset that fails before it applies anything (typically the ServerSettings look
 
 ## Requirements & limitations
 
-- **Login**: by default a human completes the Intersight SSO login once in the opened window (the session then persists in the browser profile). For **unattended/overnight runs**, configure Cisco ID credentials + TOTP so the server logs itself in and re-logins on expiry — see [UNATTENDED_LOGIN.md](UNATTENDED_LOGIN.md).
-- **Session expiry**: Intersight web sessions have an idle timeout (account-configurable). Without auto-login configured, vKVM launches start failing with 401 and a human must log in again; with it configured, the keepalive + re-login self-heals and `launch_vkvm_session` recovers automatically.
+- **Login**: by default a human completes the Intersight SSO login once in the daemon's browser window (the session then persists in the browser profile). For **unattended/overnight runs**, configure Cisco ID credentials + TOTP so the daemon logs itself in — **once per need, only for a recorder that needs its console, and only once the session is proven gone**; bursts of logins have locked the account out of Intersight, so nothing retries by itself. See [UNATTENDED_LOGIN.md](UNATTENDED_LOGIN.md).
+- **Session expiry**: Intersight web sessions have an idle timeout (account-configurable) and a 25h absolute lifetime; the keepalive ping prevents the idle one. Without auto-login configured, vKVM launches start failing with 401 and a human must log in again. With it configured, the recorder that first finds the session gone logs in once; if that attempt fails, automatic login is disarmed and `vkvm_record_status` / `browser_status` say so — `browser_login` tries exactly once more.
 - **Desktop session**: the headed browser needs a desktop (this is a Windows workstation setup; on a headless host you would need a virtual display).
 - **License/privilege**: tunneled vKVM requires the Intersight Advantage tier and a role with the *Launch vKVM* privilege.
 - **Tab lifetime**: KVM pages live inside the managed browser. Closing the window (or the MCP server exiting) ends the console sessions; the login cookies persist.

@@ -44,6 +44,7 @@ import { consoleCanvasGeometryPageScript } from '../utils/consoleCanvasCapture.j
 import { DAEMON_PROFILE_DIR, ownedBrowserLaunchOptions, pickNavigablePage } from './browserAcquisition.js';
 import { consolePasteClosePageScript, consolePastePageScript } from '../utils/consolePaste.js';
 import { lockoutExemptionReason } from '../utils/loginFailureClassification.js';
+import { LoginPolicy, type LoginTrigger, type SessionEvidence } from './loginPolicy.js';
 import { CISCO_ID_EMAIL_SELECTORS } from '../utils/intersightLoginForm.js';
 import {
   isLoginButtonReady,
@@ -128,19 +129,25 @@ export class BrowserService {
   private sso: SsoConfig;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private loginInFlight: Promise<any> | null = null;
+  /** The session-evidence probe in progress, shared by concurrent ensureLoggedIn callers. */
+  private evidenceInFlight: Promise<SessionEvidence> | null = null;
   private lastLoginAt: number | null = null;
   private loginCount = 0;
-  private lastKeepalive: { at: number; ok: boolean; reloggedIn?: boolean } | null = null;
-  // Consecutive auto-login failures. Repeatedly submitting a bad password would
-  // risk locking the Cisco ID account, so auto-login self-disables after a few.
-  private loginFailures = 0;
-  private static readonly MAX_LOGIN_FAILURES = 3;
+  private lastKeepalive: { at: number; ok: boolean } | null = null;
+  /** Set once a failed keepalive ping has been logged; cleared by the next good one. */
+  private keepaliveFailureLogged = false;
   /**
-   * Failures that never sent a credential. Reported, retried freely, and
-   * deliberately kept OUT of the lockout budget: they cannot lock an account.
+   * How many recorders need a console right now. Told by the account daemon;
+   * until it says otherwise, none do — and with none, no web login happens.
    */
-  private mechanicalLoginFailures = 0;
-  private loginDisabledReason: string | null = null;
+  private recorderCensus: () => number = () => 0;
+  /**
+   * Whether a Cisco ID web login may happen at all (see loginPolicy.ts): one
+   * attempt per need and never a retry, only once the session is proven gone,
+   * and only while a recorder needs a console. ensureLoggedIn is the one place
+   * that consults it, and every login goes through ensureLoggedIn.
+   */
+  private readonly loginPolicy = new LoginPolicy({ activeRecorders: () => this.recorderCensus() });
   // Continuous console recorders, one per server MOID.
   private recorders = new Map<string, VkvmRecorder>();
   private readonly recordingDir: string;
@@ -303,16 +310,14 @@ export class BrowserService {
         { timeout: 8000 }
       )
       .catch(() => {});
-    let loggedIn = await this.isLoggedIn();
-    let autoLoginResult: any;
-
-    // Unattended mode: log in automatically if credentials are configured.
-    if (!loggedIn && this.sso.autoLogin) {
-      autoLoginResult = await this.ensureLoggedIn();
-      loggedIn = !!autoLoginResult?.loggedIn;
-    }
+    // Through the login policy like every other road to a login: opening the
+    // window is no reason to log in by itself. It logs in only when a recorder
+    // needs a console and the session is proven gone; otherwise the window is
+    // left open for a human.
+    const session = await this.ensureLoggedIn({ trigger: 'explicit' });
+    const loggedIn = !!session?.loggedIn;
     if (loggedIn) {
-      // Keep the session alive (and self-heal on expiry) for long runs.
+      // Keep the session alive for long runs (a ping only; it never logs in).
       this.startKeepalive();
     }
 
@@ -321,14 +326,11 @@ export class BrowserService {
       url: page.url(),
       loggedIn,
       autoLogin: this.autoLoginStatus(),
-      ...(autoLoginResult ? { autoLoginResult } : {}),
+      ...(session && (session.action !== 'none' || session.reason) ? { autoLoginResult: session } : {}),
       instructions: loggedIn
-        ? this.sso.autoLogin
-          ? 'Logged in. Automatic Cisco ID re-login and session keepalive are active, so the session should survive unattended runs.'
-          : 'Already logged in - the existing session cookies are valid.'
-        : this.sso.configured
-          ? 'Automatic login did not succeed - see autoLoginResult. You can log in manually in the open browser window.'
-          : 'A browser window is now open. Ask the user to complete the Intersight login (SSO/MFA) in it, then call browser_status to verify loggedIn=true. For unattended runs, configure INTERSIGHT_SSO_CREDENTIALS_FILE so the server can log in by itself.',
+        ? 'Logged in - the session is valid. The keepalive pings it; it never logs in by itself.'
+        : `Not logged in. ${session?.reason ?? session?.error ?? ''} ` +
+          'A human can log in manually (SSO/MFA) in the open browser window, then call browser_status to verify loggedIn=true.',
     };
   }
 
@@ -417,6 +419,88 @@ export class BrowserService {
     }
   }
 
+  /**
+   * What is actually known about the session — the evidence the login policy
+   * decides on. Only 'proven-logged-out' can ever justify a web login.
+   *
+   * A 401 from the API ping is NOT proof. On a fresh daemon, or before any page
+   * has reached the regional host, activeOrigin() is the bare intersight.com,
+   * and the bare origin ALWAYS 401s: the session cookies live on the regional
+   * host (e.g. us-east-1.intersight.com). Treating that 401 as "logged out" is
+   * how warm starts used to perform a full needless login over a valid session.
+   * So a 401/403 sends a page to an app route and watches what Intersight does:
+   * a live session redirects it to the regional host (re-ping there: 2xx is
+   * 'valid'), a dead one shows the sign-in page — and only seeing the sign-in
+   * page is proof. Anything else (another status, a timeout, an exception, a
+   * page that never settles) is 'unknown', on which nothing logs in.
+   */
+  private async sessionEvidence(): Promise<SessionEvidence> {
+    try {
+      const context = await this.ensureContext();
+      const ping = async (): Promise<number> => {
+        const url = `${this.activeOrigin()}/api/v1/iam/Accounts?$top=1`;
+        const response = await context.request.get(url, { headers: await this.sessionHeaders(url) });
+        return response.status();
+      };
+      const first = await ping();
+      if (first >= 200 && first < 300) {
+        return 'valid';
+      }
+      if (first !== 401 && first !== 403) {
+        return 'unknown';
+      }
+
+      const page = await this.pageToNavigate(context);
+      await page
+        .goto(`${this.origin}/an/infrastructure-service/an/compute/physical-summaries`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        })
+        .catch(() => {});
+      const onRegionalHost = (u: string): boolean => {
+        try {
+          const h = new URL(u).hostname.toLowerCase();
+          return /\.intersight\.com$/.test(h) && h !== 'www.intersight.com';
+        } catch {
+          return false;
+        }
+      };
+      const signInVisible = async (): Promise<boolean> => {
+        if (/redirectTo=/i.test(page.url())) {
+          return true;
+        }
+        const text = (await page
+          .evaluate(`(document.body && document.body.innerText) || ''`)
+          .catch(() => '')) as string;
+        return /Sign In with Cisco ID|Welcome to Intersight/i.test(text);
+      };
+      const deadline = Date.now() + 8000;
+      let signIn = false;
+      while (Date.now() < deadline) {
+        if (onRegionalHost(page.url())) {
+          break;
+        }
+        if (await signInVisible()) {
+          signIn = true;
+          break;
+        }
+        await page.waitForTimeout(250).catch(() => {});
+      }
+      if (signIn) {
+        return 'proven-logged-out';
+      }
+      const second = await ping();
+      if (second >= 200 && second < 300) {
+        return 'valid';
+      }
+      // Landed on a regional host whose ping still fails: proof only if that
+      // host is showing the sign-in page by now.
+      return (await signInVisible()) ? 'proven-logged-out' : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
   async status(): Promise<any> {
     if (!this.context) {
       return {
@@ -454,12 +538,12 @@ export class BrowserService {
       keepaliveRunning: this.keepaliveTimer !== null,
       debug: this.sso.debug,
       logins: this.loginCount,
-      consecutiveFailures: this.loginFailures,
-      mechanicalFailures: this.mechanicalLoginFailures,
-      autoLoginDisabledReason: this.loginDisabledReason,
+      // Kept for compatibility with readers of the old guard; loginPolicy is the source.
+      autoLoginDisabledReason: this.loginPolicy.state().disabledReason,
+      loginPolicy: this.loginPolicy.state(),
       lastLoginAt: this.lastLoginAt ? new Date(this.lastLoginAt).toISOString() : null,
       lastKeepalive: this.lastKeepalive
-        ? { at: new Date(this.lastKeepalive.at).toISOString(), ok: this.lastKeepalive.ok, reloggedIn: !!this.lastKeepalive.reloggedIn }
+        ? { at: new Date(this.lastKeepalive.at).toISOString(), ok: this.lastKeepalive.ok }
         : null,
     };
   }
@@ -605,19 +689,52 @@ export class BrowserService {
   }
 
   /**
-   * Ensure a valid Intersight session, logging in automatically via Cisco ID if
-   * credentials are configured. Safe to call before any session-dependent
-   * operation; concurrent callers share one login attempt.
+   * Ensure a valid Intersight session — the ONE road to a Cisco ID web login.
+   *
+   * Every web login is a liability: bursts of them locked this account out of
+   * Intersight twice in a month (2026-09-26 and 2026-10-21), and each lockout
+   * cost an administrator re-adding the user, every API key, and a day. So this
+   * gathers the evidence about the session and lets the login policy decide
+   * (see loginPolicy.ts): at most ONE attempt per need and never a retry; only
+   * once the session is proven gone (the sign-in page, not a failed ping); and
+   * only while a recorder needs a console. Safe to call before any
+   * session-dependent operation; concurrent callers share one attempt.
+   *
+   * @param opts.trigger 'recorder' (the default) for a recorder needing its
+   *   console; 'explicit' for browser_login / browser_open, which may re-arm
+   *   automatic login after a failure — for exactly one more attempt.
+   * @param opts.force the old browser_login flag; now simply means 'explicit'.
+   *   It never re-runs the flow over a session that is still valid.
    */
-  async ensureLoggedIn(opts?: { force?: boolean }): Promise<any> {
-    if (opts?.force) {
-      // An explicit forced login re-arms the failure circuit breaker.
-      this.loginFailures = 0;
-      this.mechanicalLoginFailures = 0;
-      this.loginDisabledReason = null;
+  async ensureLoggedIn(opts?: { trigger?: LoginTrigger; force?: boolean }): Promise<any> {
+    const trigger: LoginTrigger = opts?.force ? 'explicit' : (opts?.trigger ?? 'recorder');
+    if (this.loginInFlight) {
+      return this.loginInFlight;
     }
-    if (!opts?.force && (await this.isLoggedIn())) {
-      return { loggedIn: true, action: 'none' };
+    if (!this.context && this.recorderCensus() <= 0) {
+      // No browser and nobody who needs a console: probing the session would
+      // launch a browser for a login that cannot happen. The policy's own
+      // no-recorder refusal is the answer.
+      const d = this.loginPolicy.decide({ trigger, evidence: 'proven-logged-out' });
+      return { loggedIn: false, action: 'none', reason: d.reason, evidence: null, loginPolicy: this.loginPolicy.state() };
+    }
+
+    // Concurrent callers share one probe: two would navigate pages under each other.
+    this.evidenceInFlight ??= this.sessionEvidence().finally(() => {
+      this.evidenceInFlight = null;
+    });
+    const evidence = await this.evidenceInFlight;
+    // Another caller may have started the attempt while this one waited.
+    if (this.loginInFlight) {
+      return this.loginInFlight;
+    }
+    const d = this.loginPolicy.decide({ trigger, evidence });
+    if (d.verdict === 'no-login-needed') {
+      this.startKeepalive();
+      return { loggedIn: true, action: 'none', evidence, loginPolicy: this.loginPolicy.state() };
+    }
+    if (d.verdict === 'refused') {
+      return { loggedIn: false, action: 'none', reason: d.reason, evidence, loginPolicy: this.loginPolicy.state() };
     }
     if (!this.sso.autoLogin) {
       return {
@@ -626,61 +743,32 @@ export class BrowserService {
         reason: this.sso.configured
           ? 'Auto-login is disabled (INTERSIGHT_SSO_AUTO_LOGIN=false).'
           : 'No SSO credentials configured. Set INTERSIGHT_SSO_CREDENTIALS_FILE (or INTERSIGHT_SSO_USERNAME/PASSWORD/TOTP) to enable unattended login, or log in manually in the browser window.',
+        evidence,
+        loginPolicy: this.loginPolicy.state(),
       };
     }
-    // Circuit breaker: never keep retrying a failing credential all night.
-    if (this.loginDisabledReason) {
-      return { loggedIn: false, action: 'none', reason: this.loginDisabledReason };
-    }
-    if (this.loginInFlight) {
-      return this.loginInFlight;
-    }
-    this.loginInFlight = this.loginWithTotpRetry().finally(() => {
-      this.loginInFlight = null;
-    });
+    // ONE attempt. Whatever it reports is recorded and final: a failure disarms
+    // automatic login, and nothing here, in the keepalive, or in a recorder's
+    // retry tick runs the flow again until an explicit request re-arms it.
+    this.loginInFlight = this.performCiscoIdLogin()
+      .then((result) => {
+        if (result?.action === 'logged-in') {
+          this.loginPolicy.recordAttempt({ outcome: 'succeeded', trigger });
+        } else if (result?.action === 'login-failed') {
+          this.loginPolicy.recordAttempt({
+            outcome: 'failed',
+            trigger,
+            error: result.error === undefined ? undefined : String(result.error),
+            failureKind: result.failureKind,
+          });
+        }
+        // 'session-reused': the session turned out valid after all; no attempt was made.
+        return { ...result, evidence, loginPolicy: this.loginPolicy.state() };
+      })
+      .finally(() => {
+        this.loginInFlight = null;
+      });
     return this.loginInFlight;
-  }
-
-  /**
-   * Run the login flow, retrying once in a FRESH TOTP window if it fails.
-   *
-   * A one-time code can only be used once: if anything else authenticated with
-   * the same secret in the same 30s window (a second MCP instance, a person
-   * logging in), Okta rejects ours and the flow dies with the generic "no valid
-   * Intersight session was detected". For an unattended overnight run that
-   * single collision would otherwise leave the agent blind until morning, so it
-   * is worth one patient retry. Counted as ONE logical attempt against the
-   * lockout breaker, since it is the same login intent.
-   */
-  private async loginWithTotpRetry(): Promise<any> {
-    const first = await this.performCiscoIdLogin();
-    if (first?.loggedIn || !this.sso.totp) {
-      return first;
-    }
-    // Undo the failure that performCiscoIdLogin recorded; the retry decides.
-    this.loginFailures = Math.max(0, this.loginFailures - 1);
-    this.loginDisabledReason = null;
-
-    let waitMs = 35000;
-    try {
-      const params = parseTotpConfig(this.sso.totp);
-      // Land in the middle of the next window, well clear of both edges.
-      waitMs = secondsRemainingInWindow(params) * 1000 + Math.floor((params.periodSeconds * 1000) / 2);
-    } catch {
-      /* fall back to the default wait */
-    }
-    console.error(`Intersight login failed; retrying in ${Math.round(waitMs / 1000)}s with a fresh TOTP code...`);
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-
-    const second = await this.performCiscoIdLogin();
-    if (!second?.loggedIn) {
-      return {
-        ...second,
-        retriedWithFreshTotp: true,
-        firstAttemptError: String(first?.error ?? '').slice(0, 200),
-      };
-    }
-    return { ...second, retriedWithFreshTotp: true };
   }
 
   /**
@@ -708,12 +796,12 @@ export class BrowserService {
         return this.finishLogin(true, steps, /* reused */ true);
       }
 
-      // Cisco ID may ALREADY have us authenticated - most often on a retry,
-      // where the first attempt completed SSO but failed to finish establishing
-      // the Intersight session. Intersight then jumps straight to the account
+      // Cisco ID may ALREADY have us authenticated - most often after an earlier
+      // attempt that completed SSO but failed to finish establishing the
+      // Intersight session. Intersight then jumps straight to the account
       // chooser and there is no login form at all. Blindly hunting for the
       // username field in that state throws "Could not find the username field"
-      // and wastes the retry, so detect it and skip ahead to account selection.
+      // and wastes the one attempt, so detect it and skip ahead to account selection.
       const atChooser =
         /selectaccount|onboarding/i.test(page.url()) ||
         ((await page
@@ -901,19 +989,19 @@ export class BrowserService {
         // ignore
       }
       const message = (error as Error).message;
-      // Only a failure that actually SUBMITTED a credential can lock the account,
-      // so only that kind spends the lockout budget. Counting mechanical failures
-      // disarmed automatic login for a daemon whose credentials were never in
-      // question — a click timeout on a still-disabled button and a missing
-      // username field were enough to reach "disabled after 3 consecutive
-      // failures", leaving it degraded with no way back.
+      // Classified for the report only. Whether a credential was submitted no
+      // longer decides anything: the old guard let "mechanical" failures retry
+      // freely, ~950 of the 26-Sep attempts were exactly that kind, and
+      // Intersight's lockout counted them all the same. ensureLoggedIn records
+      // this failure with the login policy, which disarms automatic login.
       const exemption = lockoutExemptionReason(steps);
+      const disarmedHint =
+        'Automatic login is now disarmed after this failed attempt; nothing retries by itself. ' +
+        'Inspect debugScreenshot and stepsCompleted to see how far it got, then call browser_login for exactly one ' +
+        'more attempt, or log in manually in the open browser window (the session then persists in the profile).';
       if (exemption) {
-        this.mechanicalLoginFailures++;
         console.error(
-          `Intersight auto-login failed before any credential was sent ` +
-            `(mechanical failure ${this.mechanicalLoginFailures}, lockout budget untouched at ` +
-            `${this.loginFailures}/${BrowserService.MAX_LOGIN_FAILURES}): ${message} — ${exemption}.`
+          `Intersight auto-login failed before any credential was sent; automatic login is disarmed: ${message} — ${exemption}.`
         );
         return {
           loggedIn: false,
@@ -921,39 +1009,20 @@ export class BrowserService {
           error: message,
           failureKind: 'mechanical',
           lockoutExemption: exemption,
-          consecutiveFailures: this.loginFailures,
-          mechanicalFailures: this.mechanicalLoginFailures,
-          autoLoginDisabled: !!this.loginDisabledReason,
           stepsCompleted: steps,
           debugScreenshot: debugShot,
-          hint:
-            'This attempt never reached the password, so retrying is safe and automatic login stays armed. ' +
-            'Inspect the debug screenshot and stepsCompleted to see how far it got.',
+          hint: disarmedHint,
         };
       }
-      this.loginFailures++;
-      if (this.loginFailures >= BrowserService.MAX_LOGIN_FAILURES) {
-        this.loginDisabledReason =
-          `Automatic login is disabled after ${this.loginFailures} consecutive CREDENTIAL failures (last error: ${message}). ` +
-          'This guard exists so a wrong password is not retried until the Cisco ID account locks out; only attempts that ' +
-          'actually submitted a credential are counted, so this really is about the credentials. ' +
-          'Fix the credentials, then call browser_login with force:true to re-arm, or log in manually in the browser window.';
-        this.stopKeepalive();
-        console.error(`Intersight auto-login disabled after ${this.loginFailures} consecutive failures.`);
-      } else {
-        console.error(`Intersight auto-login failed (${this.loginFailures}/${BrowserService.MAX_LOGIN_FAILURES}): ${message}`);
-      }
+      console.error(`Intersight auto-login failed after submitting a credential; automatic login is disarmed: ${message}`);
       return {
         loggedIn: false,
         action: 'login-failed',
         error: message,
         failureKind: 'credential',
-        consecutiveFailures: this.loginFailures,
-        mechanicalFailures: this.mechanicalLoginFailures,
-        autoLoginDisabled: !!this.loginDisabledReason,
         stepsCompleted: steps,
         debugScreenshot: debugShot,
-        hint: 'Cisco ID login UIs change; inspect the debug screenshot. You can always log in manually in the open browser window — the session then persists in the browser profile.',
+        hint: 'Cisco ID login UIs change. ' + disarmedHint,
       };
     }
   }
@@ -1163,10 +1232,6 @@ export class BrowserService {
       this.loginCount++;
       this.lastLoginAt = Date.now();
     }
-    // Success re-arms the circuit breaker.
-    this.loginFailures = 0;
-    this.mechanicalLoginFailures = 0;
-    this.loginDisabledReason = null;
     // Any vKVM tab from a previous (now-dead) session is useless; drop them so
     // the agent relaunches instead of screenshotting a dead console.
     for (const [moid, p] of [...this.kvmPages]) {
@@ -1185,39 +1250,47 @@ export class BrowserService {
   }
 
   /**
-   * Keep the Intersight session alive and self-heal when it expires: a periodic
-   * authenticated API ping counts as activity against the idle timeout, and a
-   * 401 triggers an automatic re-login. This is what lets an unattended
-   * overnight run keep vKVM access.
+   * Keep the Intersight session alive: a periodic authenticated API ping counts
+   * as activity against the idle timeout. It only pings. It used to re-log-in
+   * with `force` on a failed ping — which also reset the failure guard — and
+   * that loop ran all night on 2026-09-26 and locked the account out.
    */
   startKeepalive(): void {
     if (this.keepaliveTimer || this.sso.keepaliveSeconds <= 0) {
       return;
     }
     const intervalMs = Math.max(30, this.sso.keepaliveSeconds) * 1000;
-    this.keepaliveTimer = setInterval(async () => {
-      if (!this.context) {
-        return;
-      }
-      try {
-        const ok = await this.isLoggedIn();
-        if (ok) {
-          this.lastKeepalive = { at: Date.now(), ok: true };
-          return;
-        }
-        if (!this.sso.autoLogin) {
-          this.lastKeepalive = { at: Date.now(), ok: false };
-          return;
-        }
-        console.error('Intersight session expired - attempting automatic re-login...');
-        const result = await this.ensureLoggedIn({ force: true });
-        this.lastKeepalive = { at: Date.now(), ok: !!result?.loggedIn, reloggedIn: true };
-      } catch {
-        this.lastKeepalive = { at: Date.now(), ok: false };
-      }
-    }, intervalMs);
+    this.keepaliveTimer = setInterval(() => void this.keepaliveTick(), intervalMs);
     // Don't hold the process open just for the keepalive.
     this.keepaliveTimer.unref?.();
+  }
+
+  /**
+   * One keepalive ping. A failed one is recorded and reported, never acted on:
+   * a failed ping is not proof the session is gone (see sessionEvidence), and a
+   * login is only ever for a recorder that needs its console — it will log in
+   * once, through ensureLoggedIn, if the session is proven gone. Logged once
+   * per run of failures, not every tick, so a dead session does not flood the log.
+   */
+  async keepaliveTick(): Promise<void> {
+    let ok = false;
+    try {
+      ok = await this.isLoggedIn();
+    } catch {
+      ok = false;
+    }
+    this.lastKeepalive = { at: Date.now(), ok };
+    if (ok) {
+      this.keepaliveFailureLogged = false;
+      return;
+    }
+    if (!this.keepaliveFailureLogged) {
+      this.keepaliveFailureLogged = true;
+      console.error(
+        'Intersight keepalive: the session ping failed. There is no automatic re-login any more — a recorder that ' +
+          'needs its console will log in once, if the session is proven gone.'
+      );
+    }
   }
 
   stopKeepalive(): void {
@@ -1454,15 +1527,14 @@ export class BrowserService {
     }
     // Remember how to relaunch this console so a recorder can self-heal later.
     this.kvmServers.set(server.moid, server);
-    if (!(await this.isLoggedIn())) {
-      // Self-heal an expired session when auto-login is configured, so an
-      // unattended run isn't blinded by a session timeout.
-      const relogin = await this.ensureLoggedIn();
-      if (!relogin?.loggedIn) {
-        throw new Error(
-          `Not logged into Intersight in the browser. ${relogin?.reason ?? relogin?.error ?? ''} Call browser_open and complete the login first, or configure automatic login (see docs/VKVM_BROWSER.md).`.trim()
-        );
-      }
+    // Always through the login policy, never a bare isLoggedIn(): a failed ping
+    // on its own is not proof the session is gone, and ensureLoggedIn logs in
+    // (once) only when it is proven gone and a recorder needs this console.
+    const session = await this.ensureLoggedIn();
+    if (!session?.loggedIn) {
+      throw new Error(
+        `Not logged into Intersight in the browser. ${session?.reason ?? session?.error ?? ''} Call browser_open and complete the login first, or configure automatic login (see docs/VKVM_BROWSER.md).`.trim()
+      );
     }
 
     const result: any = { server: { Moid: server.moid, ObjectType: server.objectType, Name: server.name } };
@@ -2773,8 +2845,9 @@ export class BrowserService {
 
   /**
    * Re-establish a console after a session timeout, for the recorder's
-   * self-healing loop: ensure a valid Intersight session (re-logging in if the
-   * credentials allow it), then relaunch the vKVM session and return the new
+   * self-healing loop: relaunch the vKVM session (launchVkvm ensures the
+   * Intersight session through the login policy: at most one login, and only
+   * if the session is proven gone) and return the new
    * page. Skips the launcher's auto-record so it cannot clobber the very
    * recorder that is driving this recovery (which would discard its history).
    */
@@ -2785,12 +2858,7 @@ export class BrowserService {
         `No server descriptor for ${serverMoid}; cannot relaunch its console automatically (it was never launched through launch_vkvm_session).`
       );
     }
-    if (!(await this.isLoggedIn())) {
-      const login = await this.ensureLoggedIn();
-      if (!login?.loggedIn) {
-        throw new Error(`Intersight session is not valid: ${login?.reason ?? login?.error ?? 'login failed'}`);
-      }
-    }
+    // launchVkvm ensures the session itself, through the login policy.
     const launched = await this.launchVkvm(server, { forceNew: true, skipAutoRecord: true });
     if (launched?.sessionEnded) {
       throw new Error(
@@ -2883,6 +2951,16 @@ export class BrowserService {
     this.tunneledVkvmResetter = reset;
   }
 
+  /**
+   * Supply the count of recorders that need a console (owned by the account
+   * daemon, which has the recorders). The login policy refuses every web login
+   * while it reads zero, so it must stay truthful: a recorder that has released
+   * its console must stop counting the moment it does.
+   */
+  setRecorderCensus(fn: () => number): void {
+    this.recorderCensus = fn;
+  }
+
   private async resetTunneledVkvmFor(serverMoid: string): Promise<void> {
     if (!this.tunneledVkvmResetter) {
       throw new Error('No Tunneled vKVM reset is wired up');
@@ -2920,8 +2998,9 @@ export class BrowserService {
       ocrHealth: () => this.frameOcr.health(),
       // Input the agent sent counts as activity, so the nudge does not pile on top.
       lastAgentInputAt: () => this.agentInput.lastInputAtFor(serverMoid),
-      // Session timeouts are expected on long runs: re-login and relaunch the
-      // console, then hand the new page back so recording continues.
+      // Session timeouts are expected on long runs: relaunch the console (which
+      // logs in once, through the login policy, if the session is proven gone),
+      // then hand the new page back so recording continues.
       recover: () => this.recoverConsole(serverMoid),
       // Keep an idle console awake, but never while the agent is interacting.
       nudge: () => this.nudgeConsole(serverMoid),

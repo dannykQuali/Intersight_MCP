@@ -201,6 +201,70 @@ describe('browser and login work goes through the daemon', () => {
     const s = await callAccount(port, 'browserStatus');
     assert.equal(s.daemon.pid, process.pid);
   });
+
+  it('marks a browser_login as explicit, and a recorder\'s own login as not', async () => {
+    // The login policy lets an explicit request re-arm after a failure; a
+    // recorder asking again must never look like one, or every retry tick
+    // would be a fresh web login — the loop that locked the account out.
+    const fake = liveConsole();
+    const { port } = await startAccountDaemon(fake);
+    await callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' });
+    await waitForPhase(port, 'server-a');
+    const recorderDriven = fake.calls.loginOpts.at(-1);
+    assert.notEqual(recorderDriven?.trigger, 'explicit', 'a recorder-driven login is not an explicit one');
+
+    await callAccount(port, 'login', {});
+    assert.equal(fake.calls.loginOpts.at(-1)?.trigger, 'explicit');
+  });
+});
+
+/**
+ * Rule 3 of the login policy — no recorder needing a console, no web login —
+ * depends on the daemon telling its browser, truthfully and continuously, how
+ * many recorders need one. Dormant and stopped recorders have released their
+ * console and must not count: a dormant daemon logging in every four minutes
+ * was one of the loops in the 26-Sep incident.
+ */
+describe('the daemon tells its browser how many recorders need a console', () => {
+  it('counts none before any recorder exists', async () => {
+    const fake = liveConsole();
+    await startAccountDaemon(fake);
+    assert.equal(fake.census(), 0, 'the daemon must register the census, and it must start empty');
+  });
+
+  it('counts a recorder with a live console, and stops counting it once stopped', async () => {
+    const fake = liveConsole();
+    const { port } = await startAccountDaemon(fake);
+    await callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' });
+    await waitForPhase(port, 'server-a');
+    assert.equal(fake.census(), 1);
+
+    await callServer(port, 'server-a', 'stop', { force: true });
+    await waitFor(async () => fake.census() === 0, 3000);
+    assert.equal(fake.census(), 0);
+  });
+
+  it('counts a recorder that is still trying to get its console', async () => {
+    // A degraded recorder is exactly the one that will need a login.
+    const fake = fakeBrowser({ launch: { accessDenied: true } });
+    const { port } = await startAccountDaemon(fake);
+    await callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' });
+    assert.equal((await waitForPhase(port, 'server-a')).phase, 'degraded');
+    assert.equal(fake.census(), 1);
+  });
+
+  it('counts each server once, however many clients ask for it', async () => {
+    const fake = liveConsole();
+    const { port } = await startAccountDaemon(fake);
+    await Promise.all([
+      callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' }),
+      callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' }),
+      callAccount(port, 'ensureRecorder', { serverMoid: 'server-b' }),
+    ]);
+    await waitForPhase(port, 'server-a');
+    await waitForPhase(port, 'server-b');
+    assert.equal(fake.census(), 2);
+  });
 });
 
 describe('the daemon\'s own lifetime', () => {

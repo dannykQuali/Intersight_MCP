@@ -160,6 +160,62 @@ describe('no recorder, no login', () => {
   });
 });
 
+describe('browser_login is a one-time login that needs no recorder', () => {
+  const success = async () => ({ loggedIn: true, action: 'logged-in', stepsCompleted: [] });
+
+  it('opens the browser to check the session and logs in once, with no recorder', async () => {
+    const { svc, calls } = gated({ recorders: 0, login: success });
+    const r = await svc.ensureLoggedIn({ trigger: 'on-demand', force: true });
+    assert.equal(r.loggedIn, true);
+    assert.equal(calls.evidenceProbes, 1, 'the session must be checked, which needs a browser');
+    assert.equal(calls.attempts, 1);
+  });
+
+  it('never leads to another login by itself once that session is gone', async () => {
+    let evidence: SessionEvidence = 'proven-logged-out';
+    const { svc, calls } = gated({ recorders: 0, browserOpen: true, evidence: () => evidence, login: success });
+    await svc.ensureLoggedIn({ trigger: 'on-demand' });
+    assert.equal(calls.attempts, 1);
+
+    // The session expired or was logged out. Everything but browser_login asks.
+    evidence = 'proven-logged-out';
+    await svc.ensureLoggedIn();
+    await svc.ensureLoggedIn({ trigger: 'explicit' });
+    await svc.ensureLoggedIn({ force: true });
+    await svc.keepaliveTick();
+    assert.equal(calls.attempts, 1, 'only another browser_login (or a recorder) may log in again');
+  });
+
+  it('refuses a second attempt right after a failed one', async () => {
+    const { svc, calls } = gated({ recorders: 0, browserOpen: true });
+    await svc.ensureLoggedIn({ trigger: 'on-demand' });
+    const again = await svc.ensureLoggedIn({ trigger: 'on-demand', force: true });
+    assert.equal(calls.attempts, 1, 'an agent looping on browser_login must not produce a burst of logins');
+    assert.equal(again.loggedIn, false);
+    assert.match(String(again.reason), /try again/i);
+  });
+
+  it('shares one attempt between concurrent browser_login calls', async () => {
+    let release!: () => void;
+    let loginStarted!: () => void;
+    const started = new Promise<void>((resolve) => (loginStarted = resolve));
+    const { svc, calls } = gated({
+      recorders: 0,
+      login: () =>
+        new Promise((resolve) => {
+          release = () => resolve({ loggedIn: true, action: 'logged-in' });
+          loginStarted();
+        }),
+    });
+    const all = Array.from({ length: 5 }, () => svc.ensureLoggedIn({ trigger: 'on-demand' }));
+    await started;
+    release();
+    const results = await Promise.all(all);
+    assert.equal(calls.attempts, 1);
+    assert.ok(results.every((r) => r.loggedIn === true));
+  });
+});
+
 describe('the keepalive', () => {
   it('only pings; a dead session is reported, never re-logged-in', async () => {
     const { svc, calls } = gated();

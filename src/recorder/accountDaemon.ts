@@ -102,10 +102,11 @@ export class AccountDaemon {
         // Browser and login work for the MCP server's own tools. They run here
         // because this is the one process with the browser: an MCP server that
         // logged in by itself would be a second login in the same cookie jar.
-        // browser_login is the explicit request — the one thing that may re-arm
-        // automatic login after a failure, for exactly one more attempt. A
-        // recorder's own login never says 'explicit'.
-        login: async (p) => this.requireBrowser().ensureLoggedIn({ trigger: 'explicit', force: !!p?.force }),
+        // browser_login is the on-demand request: a one-time login that needs no
+        // recorder, and the thing that may re-arm automatic login after a
+        // failure, for exactly one more attempt. A recorder's own login never
+        // says 'on-demand' or 'explicit'.
+        login: async (p) => this.requireBrowser().ensureLoggedIn({ trigger: 'on-demand', force: !!p?.force }),
         browserOpen: async (p) =>
           this.requireBrowser().open(
             p?.url,

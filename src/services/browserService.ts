@@ -701,20 +701,24 @@ export class BrowserService {
    * session-dependent operation; concurrent callers share one attempt.
    *
    * @param opts.trigger 'recorder' (the default) for a recorder needing its
-   *   console; 'explicit' for browser_login / browser_open, which may re-arm
-   *   automatic login after a failure — for exactly one more attempt.
-   * @param opts.force the old browser_login flag; now simply means 'explicit'.
-   *   It never re-runs the flow over a session that is still valid.
+   *   console; 'explicit' for browser_open and 'on-demand' for browser_login,
+   *   both of which may re-arm automatic login after a failure — for exactly
+   *   one more attempt. Only 'on-demand' may log in with no recorder: a
+   *   one-time login that leads to no other login after it.
+   * @param opts.force the old browser_login flag; turns a 'recorder' request
+   *   into 'explicit'. It never re-runs the flow over a session that is valid.
    */
   async ensureLoggedIn(opts?: { trigger?: LoginTrigger; force?: boolean }): Promise<any> {
-    const trigger: LoginTrigger = opts?.force ? 'explicit' : (opts?.trigger ?? 'recorder');
+    const trigger: LoginTrigger =
+      opts?.trigger === 'on-demand' ? 'on-demand' : opts?.force ? 'explicit' : (opts?.trigger ?? 'recorder');
     if (this.loginInFlight) {
       return this.loginInFlight;
     }
-    if (!this.context && this.recorderCensus() <= 0) {
+    if (!this.context && this.recorderCensus() <= 0 && trigger !== 'on-demand') {
       // No browser and nobody who needs a console: probing the session would
       // launch a browser for a login that cannot happen. The policy's own
-      // no-recorder refusal is the answer.
+      // no-recorder refusal is the answer. (browser_login may log in without a
+      // recorder, so for it the browser is launched to look.)
       const d = this.loginPolicy.decide({ trigger, evidence: 'proven-logged-out' });
       return { loggedIn: false, action: 'none', reason: d.reason, evidence: null, loginPolicy: this.loginPolicy.state() };
     }

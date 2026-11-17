@@ -130,6 +130,88 @@ describe('rule 3: no recorder needing a console, no login', () => {
   });
 });
 
+/**
+ * browser_login is an agent asking for a session for its own needs (an API call
+ * through the browser session, say), with no console in sight. It gets ONE
+ * login, under every rule but the recorder one — and nothing it does may lead
+ * to another login by itself: no recorder needs a console, so no other trigger
+ * may log in when that session later expires or is logged out.
+ */
+describe('an on-demand login (browser_login) needs no recorder', () => {
+  const ON_DEMAND = 'on-demand' as const;
+
+  it('is allowed with no recorder when the session is proven gone', () => {
+    const { policy } = policyWith({ recorders: 0 });
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'attempt');
+  });
+
+  it('still never logs in over a valid or merely unknown session', () => {
+    const { policy } = policyWith({ recorders: 0 });
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'valid' }).verdict, 'no-login-needed');
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'unknown' }).verdict, 'refused');
+  });
+
+  it('does not open the door for any other trigger after it succeeds', () => {
+    // The one-time login must not become a standing licence: once that session
+    // is gone, nothing but another explicit request (or a recorder) logs in.
+    const { policy } = policyWith({ recorders: 0 });
+    policy.recordAttempt({ outcome: 'succeeded', trigger: ON_DEMAND });
+    for (const trigger of ['recorder', 'explicit'] as const) {
+      const d = policy.decide({ trigger, evidence: 'proven-logged-out' });
+      assert.equal(d.verdict, 'refused', `${trigger} must not log in after a one-time login`);
+    }
+  });
+
+  it('mentions itself as the way to a login when there is no recorder', () => {
+    // browser_open with no recorder refuses; the agent must learn it has a door.
+    const { policy } = policyWith({ recorders: 0 });
+    assert.match(policy.decide({ trigger: 'explicit', evidence: 'proven-logged-out' }).reason, /browser_login/);
+  });
+
+  it('cools down after a failed attempt, so an agent looping on it cannot burn logins', () => {
+    let t = 1_700_000_000_000;
+    const { policy } = policyWith({ recorders: 0, now: () => t });
+    policy.recordAttempt({ ...failed(), trigger: ON_DEMAND });
+    for (let i = 0; i < 20; i++) {
+      const d = policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' });
+      assert.equal(d.verdict, 'refused');
+    }
+    const d = policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' });
+    assert.match(d.reason, /failed/i);
+    const retryAt = new Date(t + LoginPolicy.ON_DEMAND_COOLDOWN_MS).toISOString();
+    assert.ok(d.reason.includes(retryAt), `say when it may try again (${retryAt}): ${d.reason}`);
+    assert.ok(policy.state().onDemandRetryAfter, 'browser_status must show the cooldown too');
+
+    t += LoginPolicy.ON_DEMAND_COOLDOWN_MS - 1;
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'refused');
+    t += 1;
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'attempt');
+    assert.equal(policy.state().onDemandRetryAfter, null);
+  });
+
+  it('cools down after a failure of any trigger, not only its own', () => {
+    // Intersight counts every login against the user, whoever made it.
+    const { policy } = policyWith({ recorders: 0, now: () => 1_700_000_000_000 });
+    policy.recordAttempt(failed('recorder'));
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'refused');
+  });
+
+  it('has no cooldown after a success', () => {
+    // The proof rule already stops a login over a valid session; a session that
+    // really did end deserves its one login.
+    const { policy } = policyWith({ recorders: 0 });
+    policy.recordAttempt(failed('recorder'));
+    policy.recordAttempt({ outcome: 'succeeded', trigger: 'recorder' });
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'attempt');
+  });
+
+  it('with a recorder active, keeps the explicit re-arm with no cooldown', () => {
+    const { policy } = policyWith({ recorders: 1 });
+    policy.recordAttempt(failed());
+    assert.equal(policy.decide({ trigger: ON_DEMAND, evidence: 'proven-logged-out' }).verdict, 'attempt');
+  });
+});
+
 describe('what the policy reports', () => {
   it('explains every refusal, because a silent refusal looks like a hang', () => {
     const { policy } = policyWith({ recorders: 0 });

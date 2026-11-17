@@ -202,19 +202,21 @@ describe('browser and login work goes through the daemon', () => {
     assert.equal(s.daemon.pid, process.pid);
   });
 
-  it('marks a browser_login as explicit, and a recorder\'s own login as not', async () => {
-    // The login policy lets an explicit request re-arm after a failure; a
-    // recorder asking again must never look like one, or every retry tick
-    // would be a fresh web login — the loop that locked the account out.
+  it('marks a browser_login as on-demand, and a recorder\'s own login as not', async () => {
+    // The login policy lets browser_login log in with no recorder and re-arm
+    // after a failure; a recorder asking again must never look like one, or
+    // every retry tick would be a fresh web login — the loop that locked the
+    // account out.
     const fake = liveConsole();
     const { port } = await startAccountDaemon(fake);
     await callAccount(port, 'ensureRecorder', { serverMoid: 'server-a' });
     await waitForPhase(port, 'server-a');
     const recorderDriven = fake.calls.loginOpts.at(-1);
+    assert.notEqual(recorderDriven?.trigger, 'on-demand', 'a recorder-driven login is not an on-demand one');
     assert.notEqual(recorderDriven?.trigger, 'explicit', 'a recorder-driven login is not an explicit one');
 
     await callAccount(port, 'login', {});
-    assert.equal(fake.calls.loginOpts.at(-1)?.trigger, 'explicit');
+    assert.equal(fake.calls.loginOpts.at(-1)?.trigger, 'on-demand');
   });
 });
 

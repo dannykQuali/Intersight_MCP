@@ -40,16 +40,27 @@
  *      Intersight sign-in page is showing. A failed API ping is not proof (a
  *      blip, a 5xx, a timeout, the bare origin that always 401s), and logging in
  *      over a live session is a second login for nothing.
- *   3. No recorder needing a console, no login. Not from the keepalive, not from
- *      an idle daemon, not from `browser_open`. A login only ever happens because
- *      a recorder needs its console.
+ *   3. No recorder needing a console, no automatic login. Not from the keepalive,
+ *      not from an idle daemon, not from `browser_open`. The one exception is
+ *      `browser_login` ('on-demand'): an agent asking, in so many words, for a
+ *      session for its own needs. It gets ONE login under rules 1 and 2, and it
+ *      leads to nothing after it — when that session expires or is logged out,
+ *      no other trigger may log in while no recorder needs a console. With no
+ *      recorder, it is refused for ON_DEMAND_COOLDOWN_MS after any failed
+ *      attempt, so an agent calling it in a loop cannot make a burst.
  *
  * Pure — no browser, no clock unless injected — so every rule is pinned by unit
  * tests, and BrowserService.ensureLoggedIn is the one place that consults it.
  */
 
-/** Who is asking for a login. Only an explicit request may re-arm after a failure. */
-export type LoginTrigger = 'recorder' | 'explicit';
+/**
+ * Who is asking for a login.
+ *   - 'recorder': a recorder needs its console. Refused while disarmed.
+ *   - 'explicit': browser_open. Needs a recorder; may re-arm after a failure.
+ *   - 'on-demand': browser_login. Needs no recorder (a one-time login for the
+ *     caller's own needs); may re-arm after a failure.
+ */
+export type LoginTrigger = 'recorder' | 'explicit' | 'on-demand';
 
 /**
  * What is known about the browser's Intersight session. Only
@@ -88,14 +99,29 @@ export interface LoginPolicyState {
   failuresSinceSuccess: number;
   /** Recorders needing a console at the time of the call. */
   activeRecorders: number;
+  /**
+   * While a failed attempt is recent: when a browser_login with no recorder may
+   * try again. null when it may try now.
+   */
+  onDemandRetryAfter: string | null;
 }
 
 export class LoginPolicy {
+  /**
+   * How long after a failed attempt a browser_login with no recorder is refused.
+   * Long enough that an agent calling it in a loop makes a handful of logins an
+   * hour at most, not a burst; short enough that a human who fixed the cause is
+   * not kept waiting long.
+   */
+  static readonly ON_DEMAND_COOLDOWN_MS = 15 * 60 * 1000;
+
   private readonly activeRecorders: () => number;
   private readonly now: () => number;
   private armed = true;
   private disabledReason: string | null = null;
   private lastAttempt: LoginPolicyState['lastAttempt'] = null;
+  /** When the last attempt failed, in ms; null when the last attempt succeeded. */
+  private lastFailureAtMs: number | null = null;
   private attempts = 0;
   private failuresSinceSuccess = 0;
 
@@ -124,12 +150,28 @@ export class LoginPolicy {
       };
     }
     if (this.activeRecorders() <= 0) {
-      return {
-        verdict: 'refused',
-        reason:
-          'No recorder needs a console, so no web login is made: a login only ever happens for a recorder. ' +
-          'Start one with vkvm_record_start or launch_vkvm_session, and it will log in once if the session is proven gone.',
-      };
+      if (input.trigger !== 'on-demand') {
+        return {
+          verdict: 'refused',
+          reason:
+            'No recorder needs a console, so no automatic web login is made. ' +
+            'Start one with vkvm_record_start or launch_vkvm_session, and it will log in once if the session is proven gone; ' +
+            'or call browser_login for a one-time login (it never leads to another login by itself).',
+        };
+      }
+      const retryAfter = this.onDemandRetryAfterMs();
+      if (retryAfter !== null) {
+        return {
+          verdict: 'refused',
+          reason:
+            `The last web login attempt failed at ${this.lastAttempt?.at} ` +
+            `(${this.lastAttempt?.failureKind ?? 'unknown'} failure: ${this.lastAttempt?.error ?? 'no error message'}). ` +
+            'Bursts of logins have locked this account out of Intersight, so with no recorder running browser_login ' +
+            `may try again only after ${new Date(retryAfter).toISOString()}. Meanwhile look at the failure ` +
+            '(loginPolicy.lastAttempt, the login-failure-*.png screenshot), or log in manually in the browser window.',
+        };
+      }
+      return { verdict: 'attempt', reason: 'a one-time on-demand login is allowed: the session is proven gone' };
     }
     if (!this.armed && input.trigger === 'recorder') {
       return {
@@ -157,9 +199,11 @@ export class LoginPolicy {
       this.armed = true;
       this.failuresSinceSuccess = 0;
       this.disabledReason = null;
+      this.lastFailureAtMs = null;
       return;
     }
     this.armed = false;
+    this.lastFailureAtMs = this.now();
     this.failuresSinceSuccess++;
     this.disabledReason =
       `Automatic login is disabled after a failed attempt at ${at} ` +
@@ -169,6 +213,7 @@ export class LoginPolicy {
   }
 
   state(): LoginPolicyState {
+    const retryAfter = this.onDemandRetryAfterMs();
     return {
       armed: this.armed,
       disabledReason: this.disabledReason,
@@ -176,6 +221,16 @@ export class LoginPolicy {
       attempts: this.attempts,
       failuresSinceSuccess: this.failuresSinceSuccess,
       activeRecorders: this.activeRecorders(),
+      onDemandRetryAfter: retryAfter === null ? null : new Date(retryAfter).toISOString(),
     };
+  }
+
+  /** When a no-recorder browser_login may try again, or null if it may now. */
+  private onDemandRetryAfterMs(): number | null {
+    if (this.lastFailureAtMs === null) {
+      return null;
+    }
+    const until = this.lastFailureAtMs + LoginPolicy.ON_DEMAND_COOLDOWN_MS;
+    return this.now() < until ? until : null;
   }
 }

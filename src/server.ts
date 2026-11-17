@@ -3593,13 +3593,13 @@ export class IntersightMCPServer {
       },
       {
         name: 'browser_login',
-        description: 'Ensure a valid Intersight session. Logs in via Cisco ID (username + password + TOTP, if credentials are configured) at most ONCE per call, and only when a recorder is active for some server AND the session is proven gone (the sign-in page is showing). A web login is a liability: bursts of them have locked this account out of Intersight. After a failed attempt automatic login is disarmed, and this call is the one way to try once more. It never re-logs-in over a valid session. Returns loggedIn, evidence, loginPolicy and stepsCompleted. Never returns secrets. Do not call it in a loop — if it fails, a human has to look.',
+        description: 'Ensure a valid Intersight browser session for your own needs (e.g. browser_intersight_api calls the API key alone cannot make) — no vKVM recorder is required. Logs in via Cisco ID (username + password + TOTP, if credentials are configured) at most ONCE per call, and only when the session is proven gone (the sign-in page is showing); it opens the browser to check if none is open. This is a ONE-TIME login: when that session later expires or is logged out, nothing logs in again by itself — call browser_login again if you still need it. A web login is a liability: bursts of them have locked this account out of Intersight. After a failed attempt automatic login is disarmed, and this call is the one way to try once more; with no recorder running it is refused for 15 minutes after any failed attempt (loginPolicy.onDemandRetryAfter). It never re-logs-in over a valid session. Returns loggedIn, evidence, loginPolicy and stepsCompleted. Never returns secrets. Do not call it in a loop — if it fails, a human has to look.',
         inputSchema: {
           type: 'object',
           properties: {
             force: {
               type: 'boolean',
-              description: 'Re-arms automatic login after a failed attempt and tries once — the same as calling without it; kept for compatibility. Never re-runs the flow over a session that is still valid.',
+              description: 'Kept for compatibility; changes nothing — every call is already the one-attempt, re-arming request. Never re-runs the flow over a session that is still valid.',
             },
           },
         },
